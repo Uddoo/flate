@@ -1,12 +1,12 @@
 package helmrelease
 
 import (
+	"errors"
+	"slices"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/google/go-cmp/cmp"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/home-operations/flate/internal/testutil"
 	"github.com/home-operations/flate/pkg/manifest"
@@ -146,18 +146,10 @@ data:
 	}
 }
 
-func ptrDuration(d time.Duration) *metav1.Duration {
-	out := metav1.Duration{Duration: d}
-	return &out
-}
-
-// TestReconcile_ChartSourceNotReady covers the error path: a HelmRelease
-// whose chartRef points at an OCIRepository that never reaches Ready
-// must surface "chart source ... not ready" via the depwait timeout.
+// A chart source that stays Pending fails with typed dependency provenance at force drain.
 func TestReconcile_ChartSourceNotReady(t *testing.T) {
 	c, st := newTestController(t, nil)
-	// Source CR exists but no SetArtifact + no Ready status → depwait
-	// hangs until timeout, then fails.
+	// The source exists without an artifact or Ready condition.
 	src := &manifest.OCIRepository{
 		Name: "podinfo", Namespace: "flux-system",
 		URL: "oci://example.test/podinfo",
@@ -166,19 +158,22 @@ func TestReconcile_ChartSourceNotReady(t *testing.T) {
 
 	hr := &manifest.HelmRelease{
 		Name: "podinfo", Namespace: "flux-system",
-		Timeout: ptrDuration(100 * time.Millisecond),
 		Chart: manifest.HelmChart{
 			Name: "podinfo", RepoKind: manifest.KindOCIRepository,
 			RepoName: "podinfo", RepoNamespace: "flux-system",
 		},
 	}
 	st.AddObject(hr)
+	err := c.awaitChartSource(t.Context(), hr, manifest.DrainForce)
+	if !errors.Is(err, manifest.ErrInput) || errors.Is(err, manifest.ErrObjectNotFound) {
+		t.Fatalf("chart gate category = %v", err)
+	}
 	info := dispatchToFixpoint(t, c, st, hr.Named())
 	if info.Status != store.StatusFailed {
 		t.Fatalf("status = %+v, want StatusFailed", info)
 	}
-	if !strings.Contains(info.Message, "not ready") && !strings.Contains(info.Message, "object not found") {
-		t.Errorf("expected chart-source-not-ready failure, got %q", info.Message)
+	if info.Message != "dependencies failed: "+src.Named().String()+": not ready" || !slices.Equal(info.BlockedBy(), []manifest.NamedResource{src.Named()}) {
+		t.Errorf("chart failure = %+v; blockers = %v", info, info.BlockedBy())
 	}
 }
 
@@ -192,7 +187,6 @@ func TestReconcile_DependsOnFailed(t *testing.T) {
 
 	hr := &manifest.HelmRelease{
 		Name: "depender", Namespace: "flux-system",
-		Timeout:   ptrDuration(100 * time.Millisecond),
 		DependsOn: []manifest.DependencyRef{{NamedResource: dep.Named()}},
 	}
 	st.AddObject(hr)
@@ -205,26 +199,27 @@ func TestReconcile_DependsOnFailed(t *testing.T) {
 	}
 }
 
-// TestReconcile_ParentGateWaits exercises the parent-KS gate from #221:
-// when ParentOf maps an HR to a KS that never reaches Ready, reconcile
-// times out in depwait and surfaces the parent-not-ready error.
+// A structural parent that stays Pending fails with typed dependency provenance.
 func TestReconcile_ParentGateWaits(t *testing.T) {
 	parent := &manifest.Kustomization{Name: "apps", Namespace: "flux-system"}
 	hr := &manifest.HelmRelease{
 		Name: "child", Namespace: "flux-system",
-		Timeout: ptrDuration(80 * time.Millisecond),
 	}
 	c, st := newTestControllerWithParentOf(t, map[manifest.NamedResource]manifest.NamedResource{
 		hr.Named(): parent.Named(),
 	})
 	st.AddObject(parent) // never reaches Ready
 	st.AddObject(hr)
+	err := c.reconcile(t.Context(), hr, manifest.DrainForce)
+	if !errors.Is(err, manifest.ErrInput) || errors.Is(err, manifest.ErrObjectNotFound) {
+		t.Fatalf("parent gate category = %v", err)
+	}
 	info := dispatchToFixpoint(t, c, st, hr.Named())
 	if info.Status != store.StatusFailed {
 		t.Fatalf("status = %+v, want StatusFailed", info)
 	}
-	if !strings.Contains(info.Message, "parent") {
-		t.Errorf("expected parent-not-ready error, got %q", info.Message)
+	if info.Message != "dependencies failed: "+parent.Named().String()+": not ready" || !slices.Equal(info.BlockedBy(), []manifest.NamedResource{parent.Named()}) {
+		t.Errorf("parent failure = %+v; blockers = %v", info, info.BlockedBy())
 	}
 }
 
@@ -238,7 +233,6 @@ func TestReconcile_ParentGateViaResolverFunc(t *testing.T) {
 	parent := &manifest.Kustomization{Name: "apps", Namespace: "flux-system"}
 	hr := &manifest.HelmRelease{
 		Name: "child", Namespace: "flux-system",
-		Timeout: ptrDuration(80 * time.Millisecond),
 	}
 	// Resolver returns the parent for the HR only — closes over
 	// captured state, the production shape (which combines a map +
@@ -256,8 +250,8 @@ func TestReconcile_ParentGateViaResolverFunc(t *testing.T) {
 	if info.Status != store.StatusFailed {
 		t.Fatalf("status = %+v, want StatusFailed", info)
 	}
-	if !strings.Contains(info.Message, "parent") {
-		t.Errorf("expected parent-not-ready error via resolver, got %q", info.Message)
+	if info.Message != "dependencies failed: "+parent.Named().String()+": not ready" || !slices.Equal(info.BlockedBy(), []manifest.NamedResource{parent.Named()}) {
+		t.Errorf("parent resolver failure = %+v; blockers = %v", info, info.BlockedBy())
 	}
 }
 
@@ -303,8 +297,7 @@ func TestReconcile_MissingChartFails(t *testing.T) {
 	c, st := newTestController(t, nil)
 	hr := &manifest.HelmRelease{
 		Name: "broken", Namespace: "flux-system",
-		Timeout: ptrDuration(80 * time.Millisecond),
-		// Chart left empty — depwait on an unset source ref times out.
+		// An unset chart source fails the dependency gate.
 	}
 	st.AddObject(hr)
 	info := dispatchToFixpoint(t, c, st, hr.Named())

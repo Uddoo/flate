@@ -283,8 +283,7 @@ func TestRun_BlockedByPrimaryFailure(t *testing.T) {
 	s.AddObject(&manifest.Kustomization{Name: root.Name, Namespace: root.Namespace})
 	s.AddObject(&manifest.Kustomization{Name: child.Name, Namespace: child.Namespace})
 	s.UpdateStatus(root, store.StatusFailed, "kustomize build boom") // primary
-	s.UpdateStatus(child, store.StatusFailed, "dependencies failed: cluster-apps")
-	s.SetBlocked(child, []manifest.NamedResource{root})
+	s.UpdateFailure(child, &manifest.DependencyFailedError{Parent: child, Failed: []manifest.NamedResource{root}})
 
 	rep := Run(Job{Store: s})
 	if rep.Failed != 1 || len(rep.Blocked) != 1 {
@@ -356,36 +355,57 @@ func TestRun_SurfacesNonRosterFailure(t *testing.T) {
 	}
 }
 
-// TestRun_SkipsSyntheticHelmChartFailure pins the dedup half of the scan: a
-// synthetic HelmChart (internal plumbing flate materializes to fetch an HR's
-// chart) is never a first-class tested kind, and its failure always re-surfaces
-// on the consuming HR's own row. Listing the hash-suffixed chart id again would
-// be pure duplication, so the scan skips KindHelmChart.
-func TestRun_SkipsSyntheticHelmChartFailure(t *testing.T) {
-	s := store.New()
-	hr := manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: "nvidia", Name: "gpu-operator"}
-	chart := manifest.NamedResource{Kind: manifest.KindHelmChart, Namespace: "nvidia", Name: "nvidia-gpu-operator-16d855d"}
-	s.AddObject(&manifest.HelmRelease{Name: hr.Name, Namespace: hr.Namespace})
-	s.AddObject(&manifest.HelmChartSource{Name: chart.Name, Namespace: chart.Namespace})
-	s.UpdateStatus(hr, store.StatusFailed, "chart source HelmChart/nvidia/nvidia-gpu-operator-16d855d not ready: 404 Not Found")
-	s.UpdateStatus(chart, store.StatusFailed, "download chart: 404 Not Found")
+func TestRun_BlockedRootReason(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		root       manifest.BaseManifest
+		include    func(manifest.NamedResource) bool
+		wantFailed int
+		wantReason string
+	}{
+		{
+			name:       "synthetic HelmChart",
+			root:       &manifest.HelmChartSource{Name: "chart-16d855d", Namespace: "apps"},
+			wantReason: "blocked by apps/chart-16d855d: fetch artifact: 404 Not Found",
+		},
+		{
+			name:       "filtered-out OCIRepository",
+			root:       &manifest.OCIRepository{Name: "source", Namespace: "flux-system"},
+			include:    func(id manifest.NamedResource) bool { return id.Namespace == "apps" },
+			wantReason: "blocked by flux-system/source: fetch artifact: 404 Not Found",
+		},
+		{
+			name:       "reported OCIRepository",
+			root:       &manifest.OCIRepository{Name: "source", Namespace: "flux-system"},
+			wantFailed: 1,
+			wantReason: "blocked by flux-system/source",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := store.New()
+			hr := manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: "apps", Name: "demo"}
+			root := tc.root.Named()
+			s.AddObject(&manifest.HelmRelease{Name: hr.Name, Namespace: hr.Namespace})
+			s.AddObject(tc.root)
+			s.UpdateFailure(hr, &manifest.DependencyFailedError{Parent: hr, Failed: []manifest.NamedResource{root}})
+			s.UpdateStatus(root, store.StatusFailed, "flux error: input error: fetch artifact: 404 Not Found")
 
-	rep := Run(Job{Store: s})
-	if rep.Failed != 1 {
-		t.Fatalf("want only the HR counted as failed, got %+v", rep)
-	}
-	for _, c := range rep.Cases {
-		if c.ID.Kind == manifest.KindHelmChart {
-			t.Errorf("synthetic HelmChart must not get its own row: %+v", c)
-		}
-	}
-	// Write renders only Cases (+ blocked folds), so the Case-level check above
-	// already guarantees no separate HelmChart row; confirm the consuming HR
-	// row still carries the chart error so the failure isn't lost.
-	var b bytes.Buffer
-	_ = rep.Write(&b, nil, nil, false, 0)
-	if out := b.String(); !strings.Contains(out, "gpu-operator") || !strings.Contains(out, "404") {
-		t.Errorf("the consuming HR row must still carry the chart error:\n%s", out)
+			rep := Run(Job{Store: s, Kinds: []string{manifest.KindHelmRelease}, Include: tc.include})
+			if rep.Matched != 1+tc.wantFailed || rep.Failed != tc.wantFailed || len(rep.Blocked) != 1 || !rep.AnyFailed() {
+				t.Fatalf("want %d failed + 1 blocked, got %+v", tc.wantFailed, rep)
+			}
+			want := []Case{{ID: hr, Outcome: OutcomeBlocked, Reason: tc.wantReason}}
+			if !reflect.DeepEqual(rep.Blocked, want) {
+				t.Fatalf("Blocked = %+v, want %+v", rep.Blocked, want)
+			}
+			var b bytes.Buffer
+			if err := rep.Write(&b, nil, nil, false, 0); err != nil {
+				t.Fatal(err)
+			}
+			if out := b.String(); !strings.Contains(out, "apps/demo") || strings.Count(out, "fetch artifact: 404 Not Found") != 1 || strings.Contains(out, "flux error:") {
+				t.Errorf("report must show the root error exactly once without sentinel prefixes:\n%s", out)
+			}
+		})
 	}
 }
 
@@ -398,8 +418,7 @@ func TestRun_BlockedByMissingDep(t *testing.T) {
 	child := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "volsync-system", Name: "kopiur-repository"}
 	missing := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "kopiur-system", Name: "kopiur"}
 	s.AddObject(&manifest.Kustomization{Name: child.Name, Namespace: child.Namespace})
-	s.UpdateStatus(child, store.StatusFailed, "dependencies failed: kopiur")
-	s.SetBlocked(child, []manifest.NamedResource{missing})
+	s.UpdateFailure(child, &manifest.DependencyFailedError{Parent: child, Failed: []manifest.NamedResource{missing}})
 
 	rep := Run(Job{Store: s})
 	if rep.Failed != 0 || len(rep.Blocked) != 1 {
@@ -431,10 +450,8 @@ func TestRun_BlockedByCycle(t *testing.T) {
 	s.AddObject(&manifest.Kustomization{Name: ks.Name, Namespace: ks.Namespace})
 	s.AddObject(&manifest.HelmRelease{Name: hr.Name, Namespace: hr.Namespace})
 	// A ⇄ B: each blocked on the other, both terminally failed — a closed cycle.
-	s.UpdateStatus(ks, store.StatusFailed, "dependencies failed: hr-b")
-	s.UpdateStatus(hr, store.StatusFailed, "dependencies failed: ks-a")
-	s.SetBlocked(ks, []manifest.NamedResource{hr})
-	s.SetBlocked(hr, []manifest.NamedResource{ks})
+	s.UpdateFailure(ks, &manifest.DependencyFailedError{Parent: ks, Failed: []manifest.NamedResource{hr}})
+	s.UpdateFailure(hr, &manifest.DependencyFailedError{Parent: hr, Failed: []manifest.NamedResource{ks}})
 
 	rep := Run(Job{Store: s})
 	if rep.Failed != 0 || len(rep.Blocked) != 2 {

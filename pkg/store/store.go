@@ -44,14 +44,8 @@ const shardCount = 16
 type shard struct {
 	mu         sync.RWMutex
 	objects    map[manifest.NamedResource]manifest.BaseManifest
-	conditions map[manifest.NamedResource][]Condition
+	conditions map[manifest.NamedResource]conditionRecord
 	artifacts  map[manifest.NamedResource]Artifact
-	// blocked records, for a resource that failed only because a dependency
-	// failed or was missing, the immediate dependency ids responsible — the
-	// structured form of a DependencyFailedError, captured at the failure sink
-	// so the failure report can group derived failures under their root cause
-	// instead of reprinting nested "dependencies failed: …" chains.
-	blocked map[manifest.NamedResource][]manifest.NamedResource
 
 	// byName mirrors the per-shard slice of the Store-wide secondary
 	// index. Keyed by Kind first so a single GetByName lookup is two
@@ -63,9 +57,8 @@ type shard struct {
 func newShard() *shard {
 	return &shard{
 		objects:    make(map[manifest.NamedResource]manifest.BaseManifest),
-		conditions: make(map[manifest.NamedResource][]Condition),
+		conditions: make(map[manifest.NamedResource]conditionRecord),
 		artifacts:  make(map[manifest.NamedResource]Artifact),
-		blocked:    make(map[manifest.NamedResource][]manifest.NamedResource),
 		byName:     make(map[string]map[string]manifest.BaseManifest),
 	}
 }
@@ -253,7 +246,7 @@ func (s *Store) AddObject(obj manifest.BaseManifest) {
 		return
 	}
 	sh.setLocked(id, obj)
-	dispatch := s.fireUnderLock(EventObjectAdded, id, obj)
+	dispatch := fireUnderLock(s, EventObjectAdded, id, obj)
 	sh.mu.Unlock()
 	dispatch()
 }
@@ -292,7 +285,7 @@ func (s *Store) AddObjects(objs []manifest.BaseManifest) {
 				continue
 			}
 			sh.setLocked(id, obj)
-			dispatches = append(dispatches, s.fireUnderLock(EventObjectAdded, id, obj))
+			dispatches = append(dispatches, fireUnderLock(s, EventObjectAdded, id, obj))
 		}
 		sh.mu.Unlock()
 	}
@@ -362,12 +355,12 @@ func (s *Store) Refire(id manifest.NamedResource) {
 		sh.mu.Unlock()
 		return
 	}
-	updated, changed := sh.setConditionLocked(id, readyCondition(StatusPending, MsgRefetching))
-	dispatchObj := s.fireUnderLock(EventObjectAdded, id, obj)
+	updated, changed := sh.setConditionLocked(id, readyCondition(StatusPending, MsgRefetching), nil)
+	dispatchObj := fireUnderLock(s, EventObjectAdded, id, obj)
 	var dispatchStatus func()
 	if changed {
-		info, _ := statusInfoFromConditions(updated)
-		dispatchStatus = s.fireUnderLock(EventStatusUpdated, id, info)
+		info, _ := updated.statusInfo()
+		dispatchStatus = fireUnderLock(s, EventStatusUpdated, id, info)
 	}
 	sh.mu.Unlock()
 	if dispatchStatus != nil {
@@ -388,7 +381,7 @@ func (s *Store) AddRendered(obj manifest.BaseManifest) {
 		return
 	}
 	sh.setLocked(id, obj)
-	dispatch := s.fireUnderLock(EventObjectAdded, id, obj)
+	dispatch := fireUnderLock(s, EventObjectAdded, id, obj)
 	sh.mu.Unlock()
 	dispatch()
 }
@@ -458,7 +451,7 @@ func (s *Store) Snapshot(id manifest.NamedResource) (manifest.BaseManifest, []Co
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 	obj := sh.objects[id]
-	conds := sh.conditions[id]
+	conds := sh.conditions[id].conditions
 	if len(conds) == 0 {
 		return obj, nil
 	}
