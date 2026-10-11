@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
 	"sync"
 
 	"golang.org/x/sync/errgroup"
@@ -58,24 +57,6 @@ func (s *Set) Contains(rel string) bool {
 	}
 	_, ok := s.paths[filepath.ToSlash(rel)]
 	return ok
-}
-
-// Reroot returns a copy of s with prefix prepended to every entry —
-// used to lift a change set produced from a subdir-relative diff up
-// into the repo-relative coordinate system that SourceFiles uses.
-func (s *Set) Reroot(prefix string) *Set {
-	if s == nil {
-		return nil
-	}
-	prefix = strings.TrimSuffix(filepath.ToSlash(prefix), "/")
-	if prefix == "" || prefix == "." {
-		return s
-	}
-	out := &Set{paths: make(map[string]struct{}, len(s.paths))}
-	for p := range s.paths {
-		out.paths[prefix+"/"+p] = struct{}{}
-	}
-	return out
 }
 
 // Detect returns the set of repo-relative file paths that differ between

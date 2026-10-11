@@ -11,11 +11,11 @@ func BenchmarkPromoteAvailable(b *testing.B) {
 	st := store.New()
 	cm := &manifest.ConfigMap{Name: "values", Namespace: "apps"}
 	st.AddObject(cm)
-	idx := NewExistenceIndex()
-	idx.Record(cm.Named(), "values.yaml")
+	idx := loaderFixture(st, nil)
+	idx.Index.Records[cm.Named()] = manifest.DiscoveryRecord{Path: "values.yaml"}
 	b.ReportAllocs()
 	for b.Loop() {
-		if !idx.Promote(st, cm.Named(), true, func(manifest.BaseManifest) bool { return true }) {
+		if !Promote(idx.Store, cm.Named(), idx.Index.Records[cm.Named()].Path, PromoteOptions{WipeSecrets: true, Admit: func(manifest.BaseManifest) bool { return true }}) {
 			b.Fatal("available ConfigMap was not found")
 		}
 	}
