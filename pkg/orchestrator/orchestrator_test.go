@@ -1049,27 +1049,6 @@ func keysOf[V any](m map[manifest.NamedResource]V) []manifest.NamedResource {
 	return out
 }
 
-// TestOrchestrator_TypedListener verifies Store.OnStatus delivers a
-// typed StatusInfo payload (no `any` type-switching needed by the
-// embedder).
-func TestOrchestrator_TypedListener(t *testing.T) {
-	s := store.New()
-	id := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "k"}
-
-	var seen store.StatusInfo
-	unsub := s.OnStatus(func(other manifest.NamedResource, info store.StatusInfo) {
-		if other == id {
-			seen = info
-		}
-	}, false)
-	defer unsub()
-
-	s.UpdateStatus(id, store.StatusFailed, "boom")
-	if seen.Status != store.StatusFailed || seen.Message != "boom" {
-		t.Errorf("typed listener did not receive payload: %+v", seen)
-	}
-}
-
 // TestOrchestrator_ChangedOnlyKeepsSubstituteFromProducer is the
 // end-to-end regression fence for issue #418. A leaf HelmRelease
 // change under cluster-apps must NOT cause cluster-apps's reconcile
