@@ -1,11 +1,10 @@
 package loader
 
 import (
-	"github.com/home-operations/flate/internal/testutil"
-	"path/filepath"
 	"slices"
 	"testing"
 
+	"github.com/home-operations/flate/internal/testutil"
 	"github.com/home-operations/flate/pkg/manifest"
 	"github.com/home-operations/flate/pkg/store"
 )
@@ -20,36 +19,12 @@ func loaderFixture(s *store.Store, files map[manifest.NamedResource]string) *Loa
 	return l
 }
 
-func inheritForTest(s *store.Store, files map[manifest.NamedResource]string, refs map[manifest.NamedResource][]manifest.NamedResource, root string) {
-	l := loaderFixture(s, files)
-	for id, r := range l.Index.Records {
-		r.Refs = refs[id]
-		l.Index.Records[id] = r
-	}
-	l.applyNamespaceInheritance(root)
-	clear(files)
-	for id, r := range l.Index.Files() {
-		files[id] = r.File
-	}
-}
-
 func stampForTest(s *store.Store, files map[manifest.NamedResource]string, root string) {
 	loaderFixture(s, files).stampTransformerTargetNamespaces(root)
 }
 
-func namespaceForTest(root, dir string) string {
-	k, _ := documentReader{}.read(filepath.Join(root, dir))
-	if k == nil {
-		return ""
-	}
-	return k.Namespace
-}
-
-func rendererFixture(s *store.Store, root string, producers *manifest.ProducerIndex, wipe bool) *manifest.DiscoveryIndex {
-	l := New(s)
-	l.Index = &manifest.DiscoveryIndex{Records: map[manifest.NamedResource]manifest.DiscoveryRecord{}}
-	l.documents = documentReader{}
-	l.Options.WipeSecrets = wipe
+func rendererFixture(t *testing.T, l *Loader, root string, producers *manifest.ProducerIndex) *manifest.DiscoveryIndex {
+	t.Helper()
 	l.FinalizeIndex(root, producers)
 	return l.Index
 }

@@ -7,8 +7,8 @@ import (
 	"github.com/home-operations/flate/pkg/store"
 )
 
-func parentsForTest(s *store.Store, repoRoot string, files map[manifest.NamedResource]string, kind string) map[manifest.NamedResource]manifest.NamedResource {
-	l := loaderFixture(s, files)
+func parentsForTest(t *testing.T, l *Loader, repoRoot, kind string) map[manifest.NamedResource]manifest.NamedResource {
+	t.Helper()
 	l.FinalizeIndex(repoRoot, nil)
 	out := map[manifest.NamedResource]manifest.NamedResource{}
 	for id, r := range l.Index.Records {
@@ -41,7 +41,7 @@ func TestBuildParentIndex_IndexedChildrenWithoutStoreObjects(t *testing.T) {
 				files[manifest.NamedResource{Kind: kind, Namespace: tc.namespace, Name: tc.name}] = tc.file
 			}
 			files[manifest.NamedResource{Kind: manifest.KindConfigMap, Namespace: "team", Name: "data"}] = "apps/team/data.yaml"
-			parents := parentsForTest(s, "", files, kind)
+			parents := parentsForTest(t, loaderFixture(s, files), "", kind)
 			for _, tc := range cases {
 				t.Run(tc.name, func(t *testing.T) {
 					id := manifest.NamedResource{Kind: kind, Namespace: tc.namespace, Name: tc.name}
@@ -166,7 +166,7 @@ func TestBuildParentIndex_CrossTreeBasePattern(t *testing.T) {
 		clusterApps.Named(): "kubernetes/clusters/main/apps.yaml",
 		karma.Named():       "kubernetes/apps/main/observability/karma.yaml",
 	}
-	parents := parentsForTest(s, "", sourceFiles, manifest.KindKustomization)
+	parents := parentsForTest(t, loaderFixture(s, sourceFiles), "", manifest.KindKustomization)
 
 	if got, want := parents[karma.Named()], clusterApps.Named(); got != want {
 		t.Errorf("karma.parent = %+v; want %+v", got, want)
@@ -205,7 +205,7 @@ func TestBuildParentIndex_DeepestPrefixWins(t *testing.T) {
 		inner.Named():      "apps/media/kustomization.yaml",
 		grandchild.Named(): "apps/media/plex/ks.yaml",
 	}
-	parents := parentsForTest(s, "", sourceFiles, manifest.KindKustomization)
+	parents := parentsForTest(t, loaderFixture(s, sourceFiles), "", manifest.KindKustomization)
 
 	if got, want := parents[grandchild.Named()], inner.Named(); got != want {
 		t.Errorf("grandchild.parent = %+v; want %+v (deepest prefix)", got, want)
@@ -228,7 +228,7 @@ func TestBuildParentIndex_NoSelfMatch(t *testing.T) {
 	sourceFiles := map[manifest.NamedResource]string{
 		ks.Named(): "apps/self/ks.yaml",
 	}
-	parents := parentsForTest(s, "", sourceFiles, manifest.KindKustomization)
+	parents := parentsForTest(t, loaderFixture(s, sourceFiles), "", manifest.KindKustomization)
 	if _, ok := parents[ks.Named()]; ok {
 		t.Errorf("KS must not be its own parent: %v", parents)
 	}
@@ -257,7 +257,7 @@ func TestBuildParentIndex_PeersSharingSamePathHaveNoParent(t *testing.T) {
 		config.Named():    "clusters/main/flux/flux-repo.yaml",
 		softServe.Named(): "clusters/main/flux/flux-repo.yaml",
 	}
-	parents := parentsForTest(s, "", sourceFiles, manifest.KindKustomization)
+	parents := parentsForTest(t, loaderFixture(s, sourceFiles), "", manifest.KindKustomization)
 	if p, ok := parents[config.Named()]; ok {
 		t.Errorf("same-spec.path peer must not be a parent: 0-config.parent = %+v", p)
 	}
@@ -290,7 +290,7 @@ func TestBuildParentIndex_RendererOfDefinitionFileStillParents(t *testing.T) {
 		// app is defined in the dir root renders, but claims ./apps.
 		app.Named(): "clusters/main/flux/app-ks.yaml",
 	}
-	parents := parentsForTest(s, "", sourceFiles, manifest.KindKustomization)
+	parents := parentsForTest(t, loaderFixture(s, sourceFiles), "", manifest.KindKustomization)
 	if got, want := parents[app.Named()], root.Named(); got != want {
 		t.Errorf("app.parent = %+v; want %+v (the KS that renders app's definition dir)", got, want)
 	}
@@ -317,7 +317,7 @@ func TestBuildParentIndex_NoSourceFileSkipped(t *testing.T) {
 		parent.Named(): "clusters/main/apps.yaml",
 		// orphan deliberately absent.
 	}
-	parents := parentsForTest(s, "", sourceFiles, manifest.KindKustomization)
+	parents := parentsForTest(t, loaderFixture(s, sourceFiles), "", manifest.KindKustomization)
 	if _, ok := parents[orphan.Named()]; ok {
 		t.Errorf("KS without source file must not appear in parent index: %v", parents)
 	}

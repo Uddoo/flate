@@ -1,103 +1,79 @@
 package loader
 
 import (
-	"cmp"
 	"encoding/base64"
+	"fmt"
+	"path/filepath"
 	"strings"
 
+	fluxfilesys "github.com/fluxcd/pkg/kustomize/filesys"
+	"sigs.k8s.io/kustomize/api/ifc"
+	"sigs.k8s.io/kustomize/api/kv"
+	kloader "sigs.k8s.io/kustomize/api/pkg/loader"
+	"sigs.k8s.io/kustomize/api/provider"
 	"sigs.k8s.io/kustomize/api/types"
+	"sigs.k8s.io/kustomize/kyaml/filesys"
 
 	"github.com/home-operations/flate/pkg/manifest"
 )
 
-// generatorRecord captures one configMapGenerator or secretGenerator
-// entry found in a kustomization.yaml during discovery, plus enough
-// context to resolve the effective namespace post-walk (kustomize
-// inherits namespace from the calling Flux Kustomization when neither
-// the generator nor the surrounding kustomization.yaml sets one).
-//
-// Tracking these records lets flate's depwait resolve dependencies
-// like `substituteFrom: [ConfigMap/<ns>/cluster-settings]` even when
-// the CM is produced by a configMapGenerator inside a Component —
-// the CM has no on-disk YAML, so the file-walker would otherwise
-// miss it.
 type generatorRecord struct {
-	// file is the absolute path to the kustomization.yaml that
-	// declared the generator. Used by the post-walk finalizer to
-	// look up the enclosing Flux Kustomization via canonical claims.
-	file string
-	// kustomizationNS is the kustomization.yaml's own `namespace:`
-	// field. Empty means "inherit from the enclosing Flux KS."
-	kustomizationNS string
-	// entryNS is the generator entry's own `namespace:`. Overrides
-	// kustomizationNS when set.
-	entryNS string
-
+	root        string
+	file        string
+	owner       manifest.NamedResource
+	namespace   string
 	isConfigMap bool
-	name        string
-	literals    []string
+	args        types.GeneratorArgs
 }
 
-// collectGeneratorRecords harvests every configMapGenerator and
-// secretGenerator declaration in k. Files/Envs entries are NOT
-// materialized (kustomize parses those at render time against the
-// caller's file system); literals are enough to make depwait happy
-// for the common cluster-settings pattern.
-func collectGeneratorRecords(k *kustomizationDocument, file string) []generatorRecord {
-	if k == nil {
-		return nil
-	}
-	out := make([]generatorRecord, 0, len(k.ConfigMapGenerator)+len(k.SecretGenerator))
-	collect := func(g types.GeneratorArgs, isConfigMap bool) {
-		if g.Name == "" {
-			return
+func (r generatorRecord) materialize(wipeSecrets bool) (manifest.BaseManifest, error) {
+	var ldr ifc.Loader
+	if len(r.args.EnvSources)+len(r.args.FileSources) != 0 {
+		root := r.root
+		if resolved, err := filepath.EvalSymlinks(root); err == nil {
+			root = resolved
 		}
-		out = append(out, generatorRecord{file: file, kustomizationNS: k.Namespace, entryNS: g.Namespace,
-			isConfigMap: isConfigMap, name: g.Name, literals: g.LiteralSources})
+		fs, err := fluxfilesys.MakeFsOnDiskSecure(root)
+		if err != nil {
+			return nil, fmt.Errorf("%w: secure generator fs %s: %w", manifest.ErrInput, root, err)
+		}
+		ldr = generatorFileLoader{Loader: kloader.NewFileLoaderAtRoot(filesys.MakeFsOnDisk()), fs: fs, dir: filepath.Dir(r.file)}
 	}
-	for _, g := range k.ConfigMapGenerator {
-		collect(g.GeneratorArgs, true)
+	pairs, err := kv.NewLoader(ldr, provider.NewDefaultDepProvider().GetFieldValidator()).Load(r.args.KvPairSources)
+	if err != nil {
+		return nil, fmt.Errorf("%w: generator %s in %s: %w", manifest.ErrInput, r.args.Name, r.file, err)
 	}
-	for _, g := range k.SecretGenerator {
-		collect(g.GeneratorArgs, false)
+	data := make(map[string]any, len(pairs))
+	for _, pair := range pairs {
+		value := pair.Value
+		if wipeSecrets && manifest.IsSopsCiphertext(value) {
+			value = fmt.Sprintf(manifest.ValuePlaceholderTemplate, pair.Key)
+		}
+		if !r.isConfigMap {
+			value = base64.StdEncoding.EncodeToString([]byte(value))
+		}
+		data[pair.Key] = value
 	}
-	return out
-}
-
-// materialize builds the synthesized manifest from r. parentNS is the
-// namespace inherited from the enclosing Flux Kustomization; the
-// caller looks it up via canonical claims against r.file. Precedence
-// matches kustomize: entry.namespace > kustomization.namespace >
-// parent (Flux KS) namespace.
-//
-// Data fidelity: literals are split on the first `=` per kustomize's
-// own KvSources conventions. Secrets land in Data (base64-encoded)
-// to match what a real k8s Secret carries; ConfigMaps land in Data
-// as strings.
-func (r generatorRecord) materialize(parentNS string) manifest.BaseManifest {
-	// kustomize precedence: entry.namespace > kustomization.namespace > parent namespace.
-	ns := cmp.Or(r.entryNS, r.kustomizationNS, parentNS)
 	if r.isConfigMap {
-		// ConfigMap data keeps the literal value as-is.
-		return &manifest.ConfigMap{Name: r.name, Namespace: ns, Data: r.literalData(func(v string) any { return v })}
+		return &manifest.ConfigMap{Name: r.args.Name, Namespace: r.namespace, Data: data}, nil
 	}
-	// Secret data is base64-encoded to match what a real k8s Secret carries.
-	return &manifest.Secret{Name: r.name, Namespace: ns, Data: r.literalData(func(v string) any {
-		return base64.StdEncoding.EncodeToString([]byte(v))
-	})}
+	return &manifest.Secret{Name: r.args.Name, Namespace: r.namespace, Data: data}, nil
 }
 
-// literalData splits each `key=value` literal into a data map, passing every
-// value through encode before it lands in the map. Literals without an `=`
-// are skipped, per kustomize's KvSources conventions.
-func (r generatorRecord) literalData(encode func(string) any) map[string]any {
-	data := make(map[string]any, len(r.literals))
-	for _, lit := range r.literals {
-		k, v, ok := strings.Cut(lit, "=")
-		if !ok {
-			continue
-		}
-		data[k] = encode(v)
+// Flux permits parent-relative files within the source root. URL loading stays
+// upstream; local reads must pass through the source-confined filesystem.
+type generatorFileLoader struct {
+	ifc.Loader
+	fs  filesys.FileSystem
+	dir string
+}
+
+func (l generatorFileLoader) Load(file string) ([]byte, error) {
+	if strings.HasPrefix(file, "http://") || strings.HasPrefix(file, "https://") {
+		return l.Loader.Load(file)
 	}
-	return data
+	if !filepath.IsAbs(file) {
+		file = filepath.Join(l.dir, file)
+	}
+	return l.fs.ReadFile(file)
 }

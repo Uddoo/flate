@@ -57,7 +57,7 @@ func (d *discoverer) seedBootstrapSource() (string, error) {
 	return root, nil
 }
 
-// aliasMissingKustomizationSources supplies missing Git/OCI sourceRefs because
+// aliasMissingKustomizationSources supplies missing Git sourceRefs because
 // Flux bootstrap and flux-operator FluxInstance create the cluster's source
 // out of band. Each alias requires a synthetic CR and a working-tree artifact.
 // All namespaces must be aliased, not just flux-system (#199): clusters can run
@@ -69,7 +69,10 @@ func (d *discoverer) aliasMissingKustomizationSources(repoRoot string) []manifes
 	// existing doubles as a dedup set: after a successful publish we add
 	// the new id so repeated sourceRefs across KSes are skipped without
 	// a second map.
-	existing := knownSourceIDs(d.cfg.Store, manifest.KindGitRepository, manifest.KindOCIRepository)
+	existing := make(map[manifest.NamedResource]struct{})
+	for _, obj := range d.cfg.Store.ListObjects(manifest.KindGitRepository) {
+		existing[obj.Named()] = struct{}{}
+	}
 	var aliased []manifest.NamedResource
 	for _, ks := range d.cfg.Store.ListAs[*manifest.Kustomization](manifest.KindKustomization) {
 		id := manifest.NamedResource{Kind: ks.SourceKind, Namespace: ks.SourceNamespace, Name: ks.SourceName}
@@ -77,10 +80,6 @@ func (d *discoverer) aliasMissingKustomizationSources(repoRoot string) []manifes
 			continue
 		}
 		if !d.publishBootstrapAlias(id, repoRoot) {
-			// Unsupported kind for aliasing (anything outside
-			// newBootstrapAlias's switch) — silently skip; the
-			// downstream depwait failure surfaces a clearer error
-			// than a misleading half-publish would.
 			continue
 		}
 		existing[id] = struct{}{}
@@ -187,39 +186,14 @@ func (d *discoverer) publishBootstrapAlias(id manifest.NamedResource, repoRoot s
 // returned separately so callers can stamp it onto the SourceArtifact
 // without re-reading the manifest.
 func newBootstrapAlias(id manifest.NamedResource, repoRoot string) (manifest.BaseManifest, string, bool) {
-	switch id.Kind {
-	case manifest.KindGitRepository:
-		url := "file://" + repoRoot
-		return &manifest.GitRepository{
-			Name: id.Name, Namespace: id.Namespace,
-			URL: url,
-		}, url, true
-	case manifest.KindOCIRepository:
-		// Synthetic oci:// URL — never resolved, only present so the
-		// store has something to return for spec.url reads. The
-		// SourceArtifact's LocalPath is what downstream consumers
-		// actually use. Embed namespace so two distinct-namespace
-		// OCIRepositories with the same name don't collide on URL.
-		url := "oci://flate-bootstrap-alias/" + id.Namespace + "/" + id.Name
-		return &manifest.OCIRepository{
-			Name: id.Name, Namespace: id.Namespace,
-			URL: url,
-		}, url, true
+	if id.Kind != manifest.KindGitRepository {
+		return nil, "", false
 	}
-	return nil, "", false
-}
-
-// knownSourceIDs returns the IDs of every object currently in s for
-// the given kinds. Used by aliasing pass 1 to skip sourceRefs that
-// already have a real CR.
-func knownSourceIDs(s *store.Store, kinds ...string) map[manifest.NamedResource]struct{} {
-	out := make(map[manifest.NamedResource]struct{})
-	for _, kind := range kinds {
-		for _, obj := range s.ListObjects(kind) {
-			out[obj.Named()] = struct{}{}
-		}
-	}
-	return out
+	url := "file://" + repoRoot
+	return &manifest.GitRepository{
+		Name: id.Name, Namespace: id.Namespace,
+		URL: url,
+	}, url, true
 }
 
 // warnIfMultipleBootstrapAliases must combine only working-tree aliases:

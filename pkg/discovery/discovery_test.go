@@ -15,6 +15,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/home-operations/flate/internal/assert"
 	"github.com/home-operations/flate/internal/testutil"
+	"github.com/home-operations/flate/pkg/change"
 	"github.com/home-operations/flate/pkg/discovery"
 	"github.com/home-operations/flate/pkg/manifest"
 	"github.com/home-operations/flate/pkg/store"
@@ -252,14 +253,7 @@ spec:
 	}
 }
 
-// TestRun_AliasesBootstrapOCIRepository pins the mortebrume/homelab
-// pattern: a Kustomization whose sourceRef points at an OCIRepository
-// (flux-operator FluxInstance publishes the bootstrap source as an
-// OCI artifact rather than a Git repo) must be aliased to the
-// working tree the same way GitRepository sources are. Without this,
-// every dependent KS fails with "dependency not found:
-// OCIRepository/flux-system/flux-system".
-func TestRun_AliasesBootstrapOCIRepository(t *testing.T) {
+func TestRun_UnknownBootstrapOCIArtifactRoot(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 
@@ -277,27 +271,23 @@ spec:
     namespace: flux-system
   interval: 1h
 `)
-	testutil.WriteFileAt(t, filepath.Join(dir, "apps", "kustomization.yaml"), "resources: []\n")
+	testutil.WriteFile(t, dir, "apps/kustomization.yaml", "resources: [hr.yaml]\n")
+	testutil.WriteFile(t, dir, "apps/hr.yaml", "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata: {name: from-working-tree, namespace: flux-system}\nspec: {chart: {spec: {chart: fixture, sourceRef: {kind: HelmRepository, name: missing}}}}\n")
 
 	st := store.New()
-	if _, err := discovery.Run(context.Background(), discovery.Config{
-		Path: dir, Store: st, WipeSecrets: true,
-	}); err != nil {
-		t.Fatalf("Run: %v", err)
+	res, err := discovery.Run(t.Context(), discovery.Config{Path: filepath.Join(dir, "flux"), RepoRoot: dir, Store: st, WipeSecrets: true})
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	aliased := manifest.NamedResource{
-		Kind: manifest.KindOCIRepository, Namespace: "flux-system", Name: "flux-system",
+	id := manifest.NamedResource{Kind: manifest.KindOCIRepository, Namespace: "flux-system", Name: "flux-system"}
+	if st.GetObject(id) != nil || st.GetArtifact(id) != nil {
+		t.Fatal("unknown OCI source must wait without a working-tree alias")
 	}
-	if st.GetObject(aliased) == nil {
-		t.Errorf("expected bootstrap OCIRepository to be aliased; only GitRepository aliasing would leave this case broken")
+	if owners, _ := res.Index.OwnersOfFile("apps/kustomization.yaml"); len(owners) != 0 {
+		t.Fatalf("unknown OCI source claimed working-tree files: %v", owners)
 	}
-	if st.GetArtifact(aliased) == nil {
-		t.Errorf("aliased OCIRepository should have a SourceArtifact so depwait resolves")
-	}
-	info, ok := st.GetStatus(aliased)
-	if !ok || info.Status != store.StatusReady {
-		t.Errorf("aliased OCIRepository should be Ready; got ok=%v info=%+v", ok, info)
+	if st.GetObject(manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: "flux-system", Name: "from-working-tree"}) != nil {
+		t.Fatal("unknown OCI source loaded a HelmRelease from the working tree")
 	}
 }
 
@@ -786,9 +776,9 @@ data: {value: fixture}
 			if err != nil {
 				t.Fatal(err)
 			}
-			raw := manifest.NamedResource{Kind: manifest.KindHelmRelease, Name: "demo", Namespace: tc.namespace}
+			raw := manifest.NamedResource{Kind: manifest.KindHelmRelease, Name: "demo", Namespace: "demo"}
 			if _, ok := res.Index.Lookup(raw); !ok {
-				t.Error("raw release must remain indexed")
+				t.Error("projected release must remain indexed")
 			}
 			if st.GetObject(raw) != nil {
 				t.Errorf("graph-owned release promoted: %s", raw)
@@ -912,6 +902,61 @@ data: {value: fixture}
 			}
 			if got, want := cfg.Store.GetArtifact(src) != nil, scenario != "external"; got != want {
 				t.Errorf("source alias = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func TestRun_ValuesFromOnlyChangeSelectsConsumer(t *testing.T) {
+	for _, ns := range []string{"apps", "other"} {
+		t.Run(ns, func(t *testing.T) {
+			root := t.TempDir()
+			for _, file := range []struct{ path, body string }{
+				{"flux/producer.yaml", "apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\nmetadata: {name: producer, namespace: flux-system}\nspec: {path: ./producer}\n"},
+				{"flux/consumer.yaml", "apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\nmetadata: {name: consumer, namespace: flux-system}\nspec: {path: ./consumer}\n"},
+				{"producer/kustomization.yaml", "namespace: apps\nresources: [values.yaml]\n"},
+				{"producer/values.yaml", "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: values}\ndata: {values.yaml: fixture}\n"},
+				{"consumer/kustomization.yaml", "namespace: " + ns + "\nresources: [hr.yaml]\n"},
+				{"consumer/hr.yaml", "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata: {name: consumer}\nspec:\n  chartRef: {kind: OCIRepository, name: chart, namespace: flux-system}\n  valuesFrom: [{kind: ConfigMap, name: values}]\n"},
+			} {
+				testutil.WriteFile(t, root, file.path, file.body)
+			}
+			st := store.New()
+			res, err := discovery.Run(t.Context(), discovery.Config{Path: filepath.Join(root, "flux"), RepoRoot: root, Store: st})
+			if err != nil {
+				t.Fatal(err)
+			}
+			filter := change.NewFilter(change.NewSet([]string{"producer/values.yaml"}), res.Index, st)
+			id := manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: ns, Name: "consumer"}
+			if got := filter.ShouldReconcile(id); got != (ns == "apps") {
+				t.Fatalf("consumer %s selected=%t", id, got)
+			}
+		})
+	}
+}
+
+func TestRun_SubstituteFromOnlyChangeSelectsConsumer(t *testing.T) {
+	for _, optional := range []bool{false, true} {
+		t.Run(fmt.Sprint(optional), func(t *testing.T) {
+			root := t.TempDir()
+			for _, file := range []struct{ path, body string }{
+				{"flux/producer.yaml", "apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\nmetadata: {name: producer, namespace: apps}\nspec: {path: ./producer}\n"},
+				{"flux/consumer.yaml", fmt.Sprintf("apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\nmetadata: {name: consumer, namespace: apps}\nspec:\n  path: ./consumer\n  postBuild:\n    substituteFrom: [{kind: ConfigMap, name: values, optional: %t}]\n", optional)},
+				{"producer/kustomization.yaml", "namespace: apps\nresources: [values.yaml]\n"},
+				{"producer/values.yaml", "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: values}\ndata: {VALUE: fixture}\n"},
+				{"consumer/kustomization.yaml", "resources: []\n"},
+			} {
+				testutil.WriteFile(t, root, file.path, file.body)
+			}
+			st := store.New()
+			res, err := discovery.Run(t.Context(), discovery.Config{Path: filepath.Join(root, "flux"), RepoRoot: root, Store: st})
+			if err != nil {
+				t.Fatal(err)
+			}
+			filter := change.NewFilter(change.NewSet([]string{"producer/values.yaml"}), res.Index, st)
+			id := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "apps", Name: "consumer"}
+			if got := filter.ShouldReconcile(id); got == optional {
+				t.Fatalf("optional=%t consumer selected=%t", optional, got)
 			}
 		})
 	}
