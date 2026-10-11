@@ -190,6 +190,28 @@ func TestBuild_BlockedCountsDistinctResources(t *testing.T) {
 	}
 }
 
+func TestSummarize_KindOnCollision(t *testing.T) {
+	hr := func(namespace, name string) manifest.NamedResource {
+		return manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: namespace, Name: name}
+	}
+	tests := []struct {
+		name string
+		ids  []manifest.NamedResource // sorted, as Build delivers them
+		want string
+	}{
+		{"same name, different kind", []manifest.NamedResource{hr("flux-system", "acars"), ks("acars")}, "HelmRelease flux-system/acars, Kustomization flux-system/acars"},
+		{"same name, different namespace", []manifest.NamedResource{hr("default", "acars"), ks("acars")}, "default/acars, flux-system/acars"},
+		{"collision hidden by the cap", []manifest.NamedResource{hr("flux-system", "zzz"), ks("a"), ks("b"), ks("c"), ks("d"), ks("e"), ks("zzz")}, "HelmRelease flux-system/zzz, flux-system/a, flux-system/b, flux-system/c, flux-system/d, flux-system/e +1 more"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := summarize(tc.ids); got != tc.want {
+				t.Errorf("summarize = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestDocument pins the one spacing rule: a leading blank line, one blank line
 // between non-empty blocks, a trailing newline, and "" when all blocks are empty.
 func TestDocument(t *testing.T) {
