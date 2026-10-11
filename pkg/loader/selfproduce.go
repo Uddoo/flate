@@ -101,14 +101,10 @@ func (l *Loader) unreachedGeneratorRoots(repoRoot string, remaining map[string]s
 
 func (l *Loader) addGenerated(generators []generatorRecord) {
 	for _, r := range generators {
-		obj, err := r.materialize(l.Options.WipeSecrets)
-		if err != nil {
-			slog.Debug("loader: skipping generator input", "file", r.file, "generator", r.args.Name, "error", err)
-			continue
-		}
-		id := obj.Named()
-		if l.Store.GetObject(id) == nil {
-			l.Store.AddObject(obj)
+		// Generator names are indexed before suffix hashing, including failed inputs.
+		id := manifest.NamedResource{Kind: manifest.KindSecret, Namespace: r.namespace, Name: r.args.Name}
+		if r.isConfigMap {
+			id.Kind = manifest.KindConfigMap
 		}
 		record := l.Index.Records[id]
 		if record.File == "" {
@@ -118,6 +114,14 @@ func (l *Loader) addGenerated(generators []generatorRecord) {
 			record.Renderers = appendUniqueProducer(record.Renderers, r.owner)
 		}
 		l.Index.Records[id] = record
+		obj, err := r.materialize(l.Options.WipeSecrets)
+		if err != nil {
+			slog.Debug("loader: skipping generator input", "file", r.file, "generator", r.args.Name, "error", err)
+			continue
+		}
+		if l.Store.GetObject(id) == nil {
+			l.Store.AddObject(obj)
+		}
 	}
 }
 
@@ -340,10 +344,11 @@ type selfProduceBuilder struct {
 func (b *selfProduceBuilder) recordProduced(v graphVisit, objects []manifest.BaseManifest) {
 	record := func(obj manifest.BaseManifest) {
 		switch o := obj.(type) {
-		case *manifest.ConfigMap:
-			b.recordConfigMap(o, v.namespace, v.fallback, v.owner)
-		case *manifest.Secret:
-			b.materializeSecret(o, v.namespace, v.fallback)
+		case *manifest.ConfigMap, *manifest.Secret:
+			b.recordDataObject(o, v.namespace, v.fallback, v.owner)
+			if s, ok := o.(*manifest.Secret); ok {
+				b.materializeSecret(s, v.namespace, v.fallback)
+			}
 		case *manifest.Kustomization:
 			b.emittedFiles[v.coordinate] = appendUniqueProducer(b.emittedFiles[v.coordinate], v.owner)
 		case *manifest.RawObject:
@@ -377,13 +382,14 @@ func (b *selfProduceBuilder) materializeSecret(s *manifest.Secret, baseNS, rootN
 	}
 }
 
-// recordConfigMap uses graph namespace, then authored namespace, then consumer fallback.
-func (b *selfProduceBuilder) recordConfigMap(cm *manifest.ConfigMap, baseNS, rootNS string, ks manifest.NamedResource) {
-	ns := cmp.Or(baseNS, cm.Namespace, rootNS)
+// Rendered data uses graph namespace, then authored namespace, then consumer fallback.
+func (b *selfProduceBuilder) recordDataObject(obj manifest.BaseManifest, baseNS, rootNS string, ks manifest.NamedResource) {
+	id := obj.Named()
+	ns := cmp.Or(baseNS, id.Namespace, rootNS)
 	if ns == "" || ks == (manifest.NamedResource{}) {
 		return
 	}
-	id := manifest.NamedResource{Kind: manifest.KindConfigMap, Namespace: ns, Name: cm.Name}
+	id.Namespace = ns
 	r := b.idx.Records[id]
 	r.Renderers = appendUniqueProducer(r.Renderers, ks)
 	b.idx.Records[id] = r

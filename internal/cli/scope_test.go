@@ -562,22 +562,26 @@ func TestAggregateScopedFailures_MissingAndCycles(t *testing.T) {
 	id := func(name string) manifest.NamedResource {
 		return manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "apps", Name: name}
 	}
-	selected, missing, a, b := id("selected"), id("missing"), id("a"), id("b")
+	selected, missing, a, b, consumer := id("selected"), id("missing"), id("a"), id("b"), id("consumer")
 	failed := map[manifest.NamedResource]store.StatusInfo{
 		selected: {Status: store.StatusFailed, Message: "missing prerequisite"},
 		a:        {Status: store.StatusFailed, Message: "cycle a"},
 		b:        {Status: store.StatusFailed, Message: "cycle b"},
+		consumer: {Status: store.StatusFailed, Message: "consumer blocked"},
 	}
-	blocked := map[manifest.NamedResource][]manifest.NamedResource{selected: {missing}, a: {b}, b: {a}}
+	blocked := map[manifest.NamedResource][]manifest.NamedResource{selected: {missing}, a: {b}, b: {a}, consumer: {a}}
 	model := failureReport(failureScope{failed: failed, blocked: blocked})
 	assert.Equal(t, len(model.Primary), 2)
 	assert.Equal(t, len(model.Missing), 1)
-	assert.Equal(t, model.Blocked, 1)
-	got := aggregateScopedFailures(failureScope{named: true, failed: failed, blocked: blocked}).Error()
-	assert.Equal(t, got, "reconcile completed with 3 failure(s):\n  Kustomization/apps/a: cycle a\n  Kustomization/apps/b: cycle b\n  Kustomization/apps/missing: not found\n  (+1 blocked by failed/missing dependencies)")
-	for _, want := range []string{missing.String(), "cycle a", "cycle b"} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("fatal cause %q hidden: %s", want, got)
+	assert.Equal(t, model.Blocked, 2)
+	assert.Diff(t, model.Primary[0].Blocks, []manifest.NamedResource{consumer})
+	for _, named := range []bool{false, true} {
+		got := aggregateScopedFailures(failureScope{named: named, failed: failed, blocked: blocked}).Error()
+		assert.Equal(t, got, "reconcile completed with 3 failure(s):\n  Kustomization/apps/a: dependency cycle: blocked by Kustomization/apps/b\n  Kustomization/apps/b: dependency cycle: blocked by Kustomization/apps/a\n  Kustomization/apps/missing: not found\n  (+2 blocked by failed/missing dependencies)")
+		for _, want := range []string{missing.String(), "blocked by " + b.String(), "blocked by " + a.String()} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("fatal cause %q hidden: %s", want, got)
+			}
 		}
 	}
 }
@@ -601,7 +605,7 @@ func TestReportFailures_FatalCycleWithWarnings(t *testing.T) {
 	if got := reportFailures(&out, scope, runErr); got == nil {
 		t.Fatal("fatal cycle became successful")
 	}
-	for _, want := range []string{"cycle a", "cycle b", "unrelated failure", "2 failed"} {
+	for _, want := range []string{"blocked by " + b.String(), "blocked by " + a.String(), "unrelated failure", "2 failed"} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("fatal cycle hidden by warnings: %s", out.String())
 		}
@@ -663,7 +667,7 @@ func TestScopedFailures_CanonicalReplacementWithStaleArtifact(t *testing.T) {
 
 func TestRun_UnnamedScope_ErrorBytes(t *testing.T) {
 	root := writeNamedScopeFixture(t)
-	want := "reconcile completed with 0 failure(s)\n  (+1 blocked by failed/missing dependencies)"
+	want := "reconcile completed with 1 failure(s):\n  Kustomization/flux-system/outside: not found\n  (+1 blocked by failed/missing dependencies)"
 	for _, verb := range []string{"get", "test"} {
 		t.Run(verb, func(t *testing.T) {
 			kind := "ks"
