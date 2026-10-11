@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"path/filepath"
 
+	kustomizev1 "github.com/fluxcd/kustomize-controller/api/v1"
+
 	"github.com/home-operations/flate/pkg/controllers/base"
 	"github.com/home-operations/flate/pkg/kustomize"
 	"github.com/home-operations/flate/pkg/manifest"
@@ -165,9 +167,10 @@ func (c *Controller) reconcile(ctx context.Context, ks *manifest.Kustomization, 
 		return err
 	}
 	// A substituteFrom Secret flate can't read offline (absent, or an
-	// ExternalSecret-synthesized empty target) leaves the ${VAR}s it would
-	// supply empty — a dependent resource may then fail schema/template
-	// validation and drop out of the render. Surface that as a non-fatal
+	// ExternalSecret-synthesized empty target) leaves its variables unavailable.
+	// References remain unchanged when substitution is skipped; otherwise they
+	// use defaults or render empty, which may cause schema/template validation
+	// failures. Surface that as a non-fatal
 	// advisory so the gap is explained rather than silent; substitution
 	// itself stays Flux-faithful. SOPS secrets resolve to placeholders and
 	// aren't reported. Render-global and keyed on the bare Secret name (not
@@ -177,7 +180,9 @@ func (c *Controller) reconcile(ctx context.Context, ks *manifest.Kustomization, 
 	for _, name := range values.UnreadableSubstituteSecrets(ks, provider) {
 		c.Store.AddWarning(manifest.Warning{
 			Category: manifest.WarnUnresolvedSubstitution,
-			Message:  fmt.Sprintf("substituteFrom Secret %q could not be read offline; the ${VAR}s it provides render empty", name),
+			Message: fmt.Sprintf("substituteFrom Secret %q could not be read offline; "+
+				"its variables are unavailable, so their ${VAR} references may remain unsubstituted "+
+				"or resolve to defaults or empty values", name),
 		})
 	}
 	if err := c.PreflightError(id); err != nil {
@@ -218,7 +223,8 @@ func (c *Controller) reconcile(ctx context.Context, ks *manifest.Kustomization, 
 	// envsubst's parser cannot handle. Mirror that behavior here:
 	// substitute per-doc, skip opted-out resources, so we match Flux
 	// bit-for-bit.
-	if ks.PostBuild != nil {
+	strategy := (kustomizev1.Kustomization{Spec: ks.KustomizationSpec}).GetSubstituteStrategy()
+	if len(ks.PostBuildSubstitute) > 0 || strategy == kustomizev1.SubstituteStrategyAlways {
 		vars := values.VarsMap(ks.PostBuildSubstitute)
 		for i, doc := range docs {
 			if manifest.HasSubstituteDisabled(doc) {
