@@ -19,6 +19,7 @@ import (
 	"github.com/home-operations/flate/pkg/manifest"
 	"github.com/home-operations/flate/pkg/source"
 	"github.com/home-operations/flate/pkg/source/bucket"
+	sourcecache "github.com/home-operations/flate/pkg/source/cache"
 	"github.com/home-operations/flate/pkg/source/cacheroot"
 	"github.com/home-operations/flate/pkg/source/external"
 	"github.com/home-operations/flate/pkg/source/git"
@@ -139,6 +140,8 @@ type Config struct {
 	// per-orchestrator cache is constructed (fine for single-orchestrator
 	// commands like `build` / `get`).
 	SourceCache *source.Cache
+	// Cache, when injected, remains caller-owned and can be shared across runs.
+	Cache *sourcecache.Cache
 	// ExternalChanges, when non-nil, supplies the file-level diff so
 	// the orchestrator skips its built-in change.Detect step. The
 	// filter is still built from this set and the discovery index
@@ -206,6 +209,7 @@ type Orchestrator struct {
 	rsc         *resourcesetctrl.Controller
 	filter      *change.Filter
 	sourceCache *source.Cache
+	cache       *sourcecache.Cache
 	// Accepted identities are immutable after bootstrap, including for late consumers.
 	substitutionSources map[manifest.NamedResource]manifest.BaseManifest
 
@@ -415,35 +419,16 @@ func New(cfg Config) (*Orchestrator, error) {
 		manifest.KindGitRepository, gitFetcher)
 	srcCtrl.Fetchers[manifest.KindExternalArtifact] = source.Wrap(
 		manifest.KindExternalArtifact, &external.Fetcher{})
-	srcCtrl.Fetchers[manifest.KindBucket] = source.Wrap(
-		manifest.KindBucket, &bucket.Fetcher{Cache: cache, Secrets: secretGet, ForceGeneric: cfg.ForceGenericProvider})
+	// Nil entries reserve default fetchers until discovery fixes their policy.
+	srcCtrl.Fetchers[manifest.KindBucket] = nil
 	// HelmRepository: existence-only — the controller just needs the
 	// resource in Ready so HelmRelease deps unblock. The chart itself is
 	// fetched per (chart, version) through a synthesized HelmChart (see
 	// materializeHelmChartSource), so every chart kind routes through the
 	// source controller uniformly.
 	srcCtrl.Fetchers[manifest.KindHelmRepository] = source.ExistenceFetcher{}
-	// Bare OCI fetcher, used two ways: as the standalone OCIRepository
-	// fetcher, and as the HelmChart fetcher's OCI-branch delegate (so
-	// OCI-backed HelmRepository charts pull with the same auth/TLS/verify).
-	// Every OCIRepository real-fetches through the source controller, like
-	// every other source kind — there is no existence-only OCI path.
-	// Embedders that want one can still WithFetcher a source.ExistenceFetcher.
-	// Not separately retry-wrapped: each consuming fetcher's own WithRetry
-	// wrapper owns retries.
-	ociFetcher := &oci.Fetcher{Cache: cache, RegistryConfig: cfg.RegistryConfig, Secrets: secretGet, ForceGeneric: cfg.ForceGenericProvider}
-	srcCtrl.Fetchers[manifest.KindOCIRepository] = source.Wrap(
-		manifest.KindOCIRepository, ociFetcher)
-	// HelmChart: the single authoritative chart fetcher. The HR controller
-	// synthesizes a HelmChart per (chart, version, repo) for every
-	// HelmRepository-sourced chart; this fetcher pulls it — HTTP repos via
-	// helm's getter, OCI repos via the OCI fetcher above.
-	hcFetcher, err := helmchart.New(secretGet, resolver.HelmRepository, ociFetcher, cache, layout)
-	if err != nil {
-		return nil, err
-	}
-	srcCtrl.Fetchers[manifest.KindHelmChart] = source.Wrap(
-		manifest.KindHelmChart, hcFetcher)
+	srcCtrl.Fetchers[manifest.KindOCIRepository] = nil
+	srcCtrl.Fetchers[manifest.KindHelmChart] = nil
 	// Wrap every registered fetcher in the classified retry decorator so
 	// transient network failures (connection resets, refused connections,
 	// timeouts) get a bounded retry the same way across all source kinds,
@@ -452,11 +437,14 @@ func New(cfg Config) (*Orchestrator, error) {
 	// any future kind picks this up automatically. Reassigning existing
 	// map values during range is well-defined (no keys added/removed).
 	for kind, f := range srcCtrl.Fetchers {
-		srcCtrl.Fetchers[kind] = source.WithRetry(f, cfg.SourceRetry)
+		if f != nil {
+			srcCtrl.Fetchers[kind] = source.WithRetry(f, cfg.SourceRetry)
+		}
 	}
 	o := &Orchestrator{
 		cfg:         cfg,
 		sourceCache: cache,
+		cache:       cfg.Cache,
 		store:       st,
 		tasks:       ts,
 		src:         srcCtrl,
@@ -604,6 +592,13 @@ func (o *Orchestrator) Bootstrap(ctx context.Context) error {
 	if o.bootstrapped {
 		return nil
 	}
+	if o.cache == nil {
+		var err error
+		o.cache, err = sourcecache.New(ctx, cacheroot.New(o.cfg.CacheDir))
+		if err != nil {
+			return err
+		}
+	}
 	res, err := discovery.Run(ctx, discovery.Config{
 		Path: o.cfg.Path, RepoRoot: o.cfg.RepoRoot, SelfURLs: o.cfg.SelfURLs,
 		KRMIgnoreFile: o.cfg.KRMIgnoreFile,
@@ -625,6 +620,24 @@ func (o *Orchestrator) Bootstrap(ctx context.Context) error {
 	o.hrc.Options.DisableChartDigestTracking = res.DisableChartDigestTracking
 	if requested := o.cfg.DisableChartDigestTracking; requested != nil {
 		o.hrc.Options.DisableChartDigestTracking = *requested
+	}
+	secretGet := func(ns, name string) *manifest.Secret {
+		secret, _ := o.store.GetByName[*manifest.Secret](manifest.KindSecret, ns, name)
+		return secret
+	}
+	resolver := helm.NewStoreSourceResolver(o.store)
+	ociFetcher := &oci.Fetcher{Cache: o.cache, RegistryConfig: o.cfg.RegistryConfig, Secrets: secretGet, ForceGeneric: o.cfg.ForceGenericProvider}
+	for kind, f := range map[string]source.Fetcher{
+		manifest.KindBucket: source.Wrap(manifest.KindBucket,
+			&bucket.Fetcher{Cache: o.cache, Secrets: secretGet, ForceGeneric: o.cfg.ForceGenericProvider}),
+		manifest.KindOCIRepository: source.Wrap(manifest.KindOCIRepository, ociFetcher),
+		manifest.KindHelmChart: source.Wrap(manifest.KindHelmChart,
+			helmchart.New(secretGet, resolver.HelmRepository, ociFetcher, helmchart.Config{
+				Cache: o.cache, DisableChartDigestTracking: o.hrc.Options.DisableChartDigestTracking})),
+	} {
+		if current, exists := o.src.Fetchers[kind]; exists && current == nil {
+			o.src.Fetchers[kind] = source.WithRetry(f, o.cfg.SourceRetry)
+		}
 	}
 	o.bootstrapped = true
 	return nil

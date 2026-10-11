@@ -13,34 +13,12 @@ import (
 // ApplyIgnore deletes every file under root that matches the source-
 // controller ignore matcher, using the defaults rule defined by [sourceignore.New].
 // Mirrors source-controller's GitRepository / OCIRepository artifact-build behavior.
-//
-// Bucket sources use ApplyIgnoreNoDefaults instead — see that function
-// for the rationale.
 func ApplyIgnore(root string, ignore *string) error {
-	return applyIgnore(root, ignore, true)
-}
-
-// ApplyIgnoreNoDefaults is the Bucket-flavored variant: it skips the
-// VCS + Default exclude patterns and applies ONLY the in-tree
-// .sourceignore plus the user-supplied spec.ignore. Mirrors
-// fluxcd/source-controller/internal/controller/bucket_controller.go
-// which uses sourceignore.NewMatcher (no defaults) rather than the
-// NewDefaultMatcher that GitRepository / OCIRepository use.
-//
-// The rationale: Bucket has no VCS semantics. An object store can
-// legitimately carry .git/-named keys, .jpg/.png images, .flux.yaml,
-// etc., and source-controller delivers them as-is. Stripping them
-// would diverge from what a cluster Bucket reconcile produces.
-func ApplyIgnoreNoDefaults(root string, ignore *string) error {
-	return applyIgnore(root, ignore, false)
-}
-
-func applyIgnore(root string, ignore *string, withDefaults bool) error {
 	abs, err := filepath.Abs(root)
 	if err != nil {
 		return fmt.Errorf("sourceignore abs: %w", err)
 	}
-	matcher, err := sourceignore.New(abs, ignore, withDefaults)
+	matcher, err := sourceignore.New(abs, ignore, true)
 	if err != nil {
 		return err
 	}
