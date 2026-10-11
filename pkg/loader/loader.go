@@ -305,11 +305,6 @@ func (w *walker) walkKustomize(ctx context.Context, dir string, k *kustomization
 		}
 		n, err := w.loader.loadFile(abs)
 		if err != nil {
-			// A file kustomize would read that isn't valid YAML fails
-			// `kustomize build` for whichever Kustomization renders
-			// this package. That parent may sit outside the scan
-			// root, so fail here rather than let the file's Flux CRs
-			// silently drop out of the run.
 			return count, fmt.Errorf("loader: %w", err)
 		}
 		count += n
@@ -596,6 +591,7 @@ func (l *Loader) skipExisting(id manifest.NamedResource) bool {
 	return l.PreferExisting && l.Store.GetObject(id) != nil
 }
 
+// Indexed discovery defers decode errors; Load without an index remains strict.
 func (l *Loader) loadFile(path string) (int, error) {
 	objs := []manifest.BaseManifest{}
 	err := decodeFileObjects(path, manifest.ParseDocOptions{WipeSecrets: l.Options.WipeSecrets}, l.documents != nil, func(obj manifest.BaseManifest) {
@@ -605,7 +601,17 @@ func (l *Loader) loadFile(path string) (int, error) {
 		objs = append(objs, obj)
 	})
 	if err != nil {
-		return 0, err
+		if l.Index == nil || !errors.Is(err, manifest.ErrInput) {
+			return 0, err
+		}
+		if l.Index.Errors == nil {
+			l.Index.Errors = make(map[string]error)
+		}
+		file := l.fileCoordinate(path)
+		if _, seen := l.Index.Errors[file]; !seen {
+			l.Index.Errors[file] = fmt.Errorf("loader: %w", err)
+		}
+		return 0, nil
 	}
 	count := 0
 	for _, obj := range objs {

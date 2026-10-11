@@ -28,6 +28,7 @@ type DiscoveryIndex struct {
 	Records map[NamedResource]DiscoveryRecord // Authored and projected identities.
 	Claims  map[string][]NamedResource        // Local-tree path claimants by slash-terminated prefix.
 	Readers map[string][]NamedResource        // Graph readers by resource file or missing directory.
+	Errors  map[string]error                  // File decode failures deferred until final source ownership is known.
 }
 
 // Lookup returns the borrowed record for id and reports whether it exists.

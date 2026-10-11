@@ -21,11 +21,14 @@ import (
 // so flate downgrades the failure to a warning rather than gating the
 // test on stale local files. A child under a parent that FAILED is a
 // blocked cascade victim, not an orphan — it stays failed (see below).
-func (o *Orchestrator) detectOrphans(failed map[manifest.NamedResource]store.StatusInfo) map[manifest.NamedResource]string {
+func (o *Orchestrator) detectOrphans(failed map[manifest.NamedResource]store.StatusInfo, prefixes []manifest.KSClaim) map[manifest.NamedResource]string {
 	out := make(map[manifest.NamedResource]string)
-	// Claims are rebuilt after drain to include runtime-created Kustomizations.
-	var prefixes []manifest.KSClaim
-	var prefixesBuilt bool
+	// External sources own decode errors but cannot parent local-tree orphans.
+	prefixes = slices.DeleteFunc(slices.Clone(prefixes), func(claim manifest.KSClaim) bool {
+		ks, _ := o.store.Get[*manifest.Kustomization](claim.ID)
+		_, _, external := loader.SourceView(o.store, ks, o.repoRoot)
+		return external
+	})
 	for id, info := range failed {
 		if !isReconcilableKind(id.Kind) {
 			continue
@@ -39,10 +42,6 @@ func (o *Orchestrator) detectOrphans(failed map[manifest.NamedResource]store.Sta
 		file := record.File
 		if file == "" {
 			continue
-		}
-		if !prefixesBuilt {
-			prefixes = loader.Claims(o.store, o.repoRoot)
-			prefixesBuilt = true
 		}
 		parent, ok := manifest.StrictParent(prefixes, file, id, nil)
 		if !ok {
@@ -77,28 +76,46 @@ func (o *Orchestrator) detectOrphans(failed map[manifest.NamedResource]store.Sta
 func (o *Orchestrator) finalize() error {
 	failed := o.store.FailedResources()
 	ksCount, hrCount := o.cascadeParentFailures(failed)
-	o.demoteOrphans(failed)
+	// Final ownership includes every Kustomization present after the drain.
+	var prefixes []manifest.KSClaim
+	if len(failed) != 0 || (o.index != nil && len(o.index.Errors) != 0) {
+		prefixes = loader.Claims(o.store, o.repoRoot)
+	}
+	o.orphans = o.detectOrphans(failed, prefixes)
+	for id, msg := range o.orphans {
+		o.store.UpdateStatus(id, store.StatusReady, "orphaned (not referenced by any parent kustomization.yaml)")
+		slog.Warn("resource orphaned", "id", id.String(),
+			"file", o.fileOf(id),
+			"reason", msg)
+		delete(failed, id)
+	}
 	o.warnMissingCRDs()
 	o.logSummary(failed, ksCount, hrCount)
 	o.logResourceFailures(failed)
 
-	// Compose any unattributed panic count with the aggregated
-	// per-resource failures so the panic signal isn't dropped when
-	// other resources also failed. Pre-fix, the panic counter was
-	// only consulted on the clean-aggregate path; a panicked task
-	// running alongside any normal failure looked indistinguishable
-	// from a clean reconcile to Service.Failures()-driven callers.
-	var panicErr error
+	var errs []error
 	if n := o.tasks.Failures(); n > 0 {
-		panicErr = fmt.Errorf("%d task(s) panicked without per-resource attribution; check logs", n)
+		errs = append(errs, fmt.Errorf("%d task(s) panicked without per-resource attribution; check logs", n))
 	}
-	if len(failed) == 0 {
-		return panicErr
+	if len(failed) != 0 {
+		errs = append(errs, o.aggregateFailures(failed))
 	}
-	if panicErr != nil {
-		return errors.Join(o.aggregateFailures(failed), panicErr)
+	if o.index != nil {
+		for _, file := range slices.Sorted(maps.Keys(o.index.Errors)) {
+			_, owned := manifest.StrictParent(prefixes, file, manifest.NamedResource{}, nil)
+			if !owned {
+				for range o.index.ReadersOfFile(file) {
+					owned = true
+					break
+				}
+			}
+			if !owned {
+				errs = append(errs, o.index.Errors[file])
+			}
+		}
 	}
-	return o.aggregateFailures(failed)
+
+	return errors.Join(errs...)
 }
 
 // warnMissingCRDs uses only final canonical references and Ready/artifact
@@ -221,25 +238,6 @@ func (o *Orchestrator) cascadeParentFailures(failed map[manifest.NamedResource]s
 		}
 	}
 	return ksCount, hrCount
-}
-
-// demoteOrphans filters out resources whose source files sit under
-// another Kustomization's spec.path but were never emitted by that
-// parent's render. Real Flux wouldn't reconcile them either — the
-// file walker only loaded them because flate scans the whole tree.
-// Surface as warnings instead of failures so the test isn't gated on
-// stale on-disk files the user has not wired into their kustomize
-// tree. Mutates the failed map in place; the demoted ids land in
-// o.orphans for Render() to surface.
-func (o *Orchestrator) demoteOrphans(failed map[manifest.NamedResource]store.StatusInfo) {
-	o.orphans = o.detectOrphans(failed)
-	for id, msg := range o.orphans {
-		o.store.UpdateStatus(id, store.StatusReady, "orphaned (not referenced by any parent kustomization.yaml)")
-		slog.Warn("resource orphaned", "id", id.String(),
-			"file", o.fileOf(id),
-			"reason", msg)
-		delete(failed, id)
-	}
 }
 
 func (o *Orchestrator) logSummary(failed map[manifest.NamedResource]store.StatusInfo, ksCount, hrCount int) {
