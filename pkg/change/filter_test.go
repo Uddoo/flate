@@ -388,7 +388,7 @@ func TestFilter_NoFileOwnerFallbackLeavesUnclaimedFileUnowned(t *testing.T) {
 	appsID := apps.Named()
 
 	f := NewFilter(NewSet([]string{"apps/base/postgres/cluster.yaml"}), filterFixture{files: map[manifest.NamedResource]string{appsID: "apps/homelab/kustomization.yaml"}, root: "", objects: testutil.MapLister{appsID: apps}}.index(), testutil.MapLister{appsID: apps})
-	if f.Size() != 0 {
+	if len(f.KeepNames()) != 0 {
 		t.Errorf("expected empty keep set without a fileOwners fallback; keep=%v", f.KeepNames())
 	}
 }
@@ -1292,5 +1292,19 @@ func TestFilter_SubstitutionGeneratorProducers(t *testing.T) {
 				t.Fatalf("producer retained = %t, optional reference = %t", got, tc.optional)
 			}
 		})
+	}
+}
+
+func TestFilter_LogValue(t *testing.T) {
+	f := &Filter{keep: map[manifest.NamedResource]struct{}{
+		{Kind: manifest.KindKustomization, Name: "z"}: {},
+		{Kind: manifest.KindKustomization, Name: "a"}: {},
+	}}
+	attrs := f.LogValue().Group()
+	if attrs[0].Key != "size" || attrs[0].Value.Int64() != 2 {
+		t.Errorf("size attribute = %v", attrs[0])
+	}
+	if got := attrs[1].Value.Any().([]string); !slices.Equal(got, f.KeepNames()) {
+		t.Errorf("items = %v, want sorted keep names", got)
 	}
 }
