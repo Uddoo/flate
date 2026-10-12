@@ -9,6 +9,8 @@ package helmrelease
 import (
 	"context"
 	"errors"
+	"fmt"
+	"slices"
 
 	"github.com/home-operations/flate/pkg/manifest"
 	"github.com/home-operations/flate/pkg/store"
@@ -37,8 +39,9 @@ import (
 // the accumulated failed-ref drops and the proactive omission are re-applied —
 // the re-applied proactive pass re-evaluates against the now-current store, so
 // a ref that materialized during the wait is correctly kept.
-func (c *Controller) resolvePreRenderValuesFrom(ctx context.Context, hr *manifest.HelmRelease, level manifest.DrainLevel) (*manifest.HelmRelease, error) {
+func (c *Controller) resolvePreRenderValuesFrom(ctx context.Context, hr *manifest.HelmRelease, level manifest.DrainLevel) (*manifest.HelmRelease, []manifest.NamedResource, error) {
 	id := hr.Named()
+	unfiltered := hr
 	// Producer-backed omission runs regardless of the flag: a ref with a
 	// declared producer is dropped, a ref without one is kept (and waited
 	// on below). requireProducer=true is what enforces that asymmetry.
@@ -60,10 +63,11 @@ func (c *Controller) resolvePreRenderValuesFrom(ctx context.Context, hr *manifes
 					continue
 				}
 			}
-			return nil, err
+			return nil, nil, err
 		}
 		if obj, ok := c.Store.Get[*manifest.HelmRelease](id); ok {
 			hr = obj
+			unfiltered = obj
 		}
 		if len(omittedValuesRefs) > 0 {
 			hr = removeValuesRefs(hr, omittedValuesRefs)
@@ -74,7 +78,17 @@ func (c *Controller) resolvePreRenderValuesFrom(ctx context.Context, hr *manifes
 		hr = c.omitValuesFrom(hr, nil, true)
 		break
 	}
-	return hr, nil
+	return hr, omittedValuesRefIDs(unfiltered, hr), nil
+}
+
+func (c *Controller) recordOmittedValues(id manifest.NamedResource, refs []manifest.NamedResource) {
+	for _, ref := range refs {
+		c.Store.AddWarning(manifest.Warning{
+			Resource: id,
+			Category: manifest.WarnOmittedValues,
+			Message:  fmt.Sprintf("required valuesFrom %s omitted from offline render", ref),
+		})
+	}
 }
 
 func (c *Controller) omitFailedValuesFrom(hr *manifest.HelmRelease, failed []manifest.NamedResource) (*manifest.HelmRelease, bool) {
@@ -170,7 +184,7 @@ func valuesRefID(hr *manifest.HelmRelease, ref manifest.ValuesReference) (manife
 }
 
 func omittedValuesRefIDs(before, after *manifest.HelmRelease) []manifest.NamedResource {
-	if before == nil || after == nil {
+	if before == nil || after == nil || len(before.ValuesFrom) == len(after.ValuesFrom) {
 		return nil
 	}
 	kept := make(map[manifest.NamedResource]struct{}, len(after.ValuesFrom))
@@ -189,7 +203,8 @@ func omittedValuesRefIDs(before, after *manifest.HelmRelease) []manifest.NamedRe
 			out = append(out, id)
 		}
 	}
-	return out
+	slices.SortFunc(out, manifest.NamedResource.Compare)
+	return slices.Compact(out)
 }
 
 func removeValuesRefs(hr *manifest.HelmRelease, ids map[manifest.NamedResource]struct{}) *manifest.HelmRelease {

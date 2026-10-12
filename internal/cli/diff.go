@@ -179,13 +179,16 @@ func runDiff(cmd *cobra.Command, c *commonFlags, h *helmFlags, d *diffFlags, kin
 	diffRunErr := scopedDiffRunError(orig, current, runErr)
 	for _, side := range []struct {
 		label string
-		scope failureScope
-	}{{"orig", orig.Failures}, {"current", current.Failures}} {
-		if len(side.scope.warnings) == 0 {
-			continue
+		run   diffSide
+	}{{"orig", orig}, {"current", current}} {
+		if len(side.run.Failures.warnings) > 0 {
+			if _, err := fmt.Fprintf(cmd.ErrOrStderr(), "%s snapshot:%s", side.label,
+				report.Document(report.WarningsBlock(side.run.Failures.warnings, style.ColorEnabled(cmd.ErrOrStderr())))); err != nil {
+				return errors.Join(err, diffRunErr)
+			}
 		}
-		if _, err := fmt.Fprintf(cmd.ErrOrStderr(), "%s snapshot:%s", side.label,
-			report.Document(report.WarningsBlock(side.scope.warnings, style.ColorEnabled(cmd.ErrOrStderr())))); err != nil {
+		if err := reportOmittedValues(cmd.ErrOrStderr(), scopedWarnings(side.run.O, side.run.Res, c),
+			side.label, manifest.NamedResource{Kind: kind, Name: name}); err != nil {
 			return errors.Join(err, diffRunErr)
 		}
 	}
@@ -227,6 +230,21 @@ func runDiff(cmd *cobra.Command, c *commonFlags, h *helmFlags, d *diffFlags, kin
 	}
 	if diffRunErr != nil {
 		return reportedError{diffRunErr}
+	}
+	return nil
+}
+
+func reportOmittedValues(w io.Writer, warnings []manifest.Warning, label string, resource manifest.NamedResource) error {
+	for _, warning := range warnings {
+		if warning.Category != manifest.WarnOmittedValues ||
+			(resource.Kind != "" && warning.Resource.Kind != resource.Kind) ||
+			(resource.Name != "" && warning.Resource.Name != resource.Name) {
+			continue
+		}
+		if _, err := fmt.Fprintf(w, "flate warning: %s snapshot: %s: %s\n",
+			label, warning.Resource, warning.Message); err != nil {
+			return err
+		}
 	}
 	return nil
 }
