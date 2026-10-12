@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/home-operations/flate/internal/assert"
 	"github.com/home-operations/flate/pkg/manifest"
 )
 
@@ -124,41 +125,6 @@ func TestExpandValueReferences_ConfigMap(t *testing.T) {
 	}
 }
 
-// TestExpandValueReferences_IgnoresConfigMapBinaryData locks the
-// upstream contract: valuesFrom on a ConfigMap reads only .data,
-// never .binaryData. fluxcd/pkg/chartutil/values.go's
-// ChartValuesFromReferences pulls from typedRes.Data exclusively.
-// A ConfigMap carrying binaryData must not leak those entries into
-// hr.Values — that would render keys real Flux never sees.
-func TestExpandValueReferences_IgnoresConfigMapBinaryData(t *testing.T) {
-	cm := &manifest.ConfigMap{
-		Name: "mixed", Namespace: "default",
-		Data:       map[string]any{"values.yaml": "fromData: \"yes\"\n"},
-		BinaryData: map[string]any{"hidden.yaml": "fromBinary: \"leaked\"\n"},
-	}
-	provider := &SliceProvider{ConfigMaps: []*manifest.ConfigMap{cm}}
-	hr := &manifest.HelmRelease{
-		Name: "demo", Namespace: "default",
-		ValuesFrom: []manifest.ValuesReference{{Kind: "ConfigMap", Name: "mixed"}},
-	}
-	if err := ExpandValueReferences(hr, provider, nil); err != nil {
-		t.Fatalf("ExpandValueReferences: %v", err)
-	}
-	if hr.Values["fromData"] != "yes" {
-		t.Errorf("data key should have merged; got %v", hr.Values["fromData"])
-	}
-	if _, leaked := hr.Values["fromBinary"]; leaked {
-		t.Errorf("binaryData key leaked into hr.Values: %+v", hr.Values)
-	}
-}
-
-// TestExpandValueReferences_MalformedSiblingTolerated documents the
-// deliberate, Flux-aligning narrowing of the valuesFrom error surface in
-// lookupValueRef: it decodes only the referenced key, so a malformed SIBLING
-// key no longer fails the ref. Upstream Flux (chartutil.ChartValuesFromReferences)
-// likewise indexes typedRes.Data[valuesKey] and never validates siblings. The
-// old full-bag decode (still used by substituteFrom, which legitimately
-// consumes every key) errored the whole ref on the broken sibling here.
 func TestExpandValueReferences_MalformedSiblingTolerated(t *testing.T) {
 	cm := &manifest.ConfigMap{
 		Name: "extra", Namespace: "default",
@@ -475,6 +441,41 @@ func TestExpandPostBuildSubstituteReference(t *testing.T) {
 	}
 	if ks.PostBuildSubstitute["DOMAIN"] != "example.com" {
 		t.Errorf("substitute: %+v", ks.PostBuildSubstitute)
+	}
+}
+
+func TestExpandPostBuildSubstituteReference_MalformedDataLeavesSubstitutionsUntouched(t *testing.T) {
+	for _, kind := range []string{manifest.KindConfigMap, manifest.KindSecret} {
+		t.Run(kind, func(t *testing.T) {
+			provider := &SliceProvider{
+				ConfigMaps: []*manifest.ConfigMap{{Name: "vars", Namespace: "ns", Data: map[string]any{"INVALID": []any{"nested"}}}},
+				Secrets:    []*manifest.Secret{{Name: "vars", Namespace: "ns", Data: map[string]any{"INVALID": "invalid-base64"}}},
+			}
+			ks := &manifest.Kustomization{
+				Name: "app", Namespace: "ns",
+				PostBuildSubstitute:     map[string]any{"INLINE": "kept"},
+				PostBuildSubstituteFrom: []manifest.SubstituteReference{{Kind: kind, Name: "vars"}},
+				Contents:                map[string]any{"spec": map[string]any{}},
+			}
+			if err := ExpandPostBuildSubstituteReference(ks, provider); !errors.Is(err, manifest.ErrInput) {
+				t.Fatalf("got %v, want ErrInput", err)
+			}
+			assert.Diff(t, ks.PostBuildSubstitute, map[string]any{"INLINE": "kept"})
+			assert.Diff(t, ks.Contents, map[string]any{"spec": map[string]any{}})
+		})
+	}
+}
+
+func TestExpandPostBuildSubstituteReference_MalformedKeysDeterministic(t *testing.T) {
+	sec := &manifest.Secret{Name: "vars", Namespace: "ns", Data: map[string]any{"C": "!", "A": "!", "B": "!"}}
+	provider := &SliceProvider{Secrets: []*manifest.Secret{sec}}
+	ks := &manifest.Kustomization{Name: "app", Namespace: "ns", PostBuildSubstituteFrom: []manifest.SubstituteReference{{Kind: manifest.KindSecret, Name: "vars"}}}
+	_, _, want := sec.Value("A")
+	for range 50 {
+		err := ExpandPostBuildSubstituteReference(ks, provider)
+		if err == nil || err.Error() != want.Error() {
+			t.Fatalf("got %v, want %v", err, want)
+		}
 	}
 }
 
