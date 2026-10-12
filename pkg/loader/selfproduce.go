@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/home-operations/flate/pkg/manifest"
+	"github.com/home-operations/flate/pkg/source/safepath"
 	"github.com/home-operations/flate/pkg/store"
 )
 
@@ -268,12 +269,18 @@ func (l *Loader) standaloneRoots(repoRoot string, kss []*manifest.Kustomization)
 	var dirs []string
 	for dir := range roots {
 		rel, err := filepath.Rel(repoRoot, dir)
-		if err == nil && !strings.HasPrefix(rel, "..") {
+		if err == nil && !safepath.Escaped(rel) {
 			dirs = append(dirs, filepath.ToSlash(rel))
 		}
 	}
 	slices.Sort(dirs)
 	return dirs
+}
+
+// Kustomize graph and transformer references use slash separators on every OS.
+func escapedSlashPath(rel string) bool {
+	rel = path.Clean(rel)
+	return rel == ".." || strings.HasPrefix(rel, "../")
 }
 
 type graphWalker struct {
@@ -283,7 +290,7 @@ type graphWalker struct {
 
 // An outer namespace stays locked across nested bases and components.
 func (w *graphWalker) walk(v graphVisit, yield func(graphVisit) bool) bool {
-	if strings.HasPrefix(v.dir, "..") {
+	if escapedSlashPath(v.dir) {
 		return true
 	}
 	d, file := w.documents.read(filepath.Join(v.root, v.dir))
