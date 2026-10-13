@@ -103,7 +103,8 @@ Leaf packages stay leaf: `tree` (stdlib only), `manifest`, `task`, `schedule` (s
 - Every package has a `// Package` doc; exported identifiers are documented. Comments state
   constraints and rationale (MUST, never, invariant), not narration, and never reference past
   behavior or the current change.
-- `CGO_ENABLED=0`; no cgo, ever.
+- No cgo code, ever; builds and releases use `CGO_ENABLED=0`. The race detector needs cgo, so
+  run `mise run test` as configured, never with `CGO_ENABLED=0`.
 - Write elegant code: names that state intent, small functions with one job and straight-line
   flow, types that make wrong states unrepresentable, no wrappers, single-use helpers or
   pass-through types, one obvious way consistent with the surrounding code. Working but
