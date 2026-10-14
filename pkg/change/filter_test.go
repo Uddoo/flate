@@ -4,7 +4,11 @@ import (
 	"slices"
 	"testing"
 
+	fluxopv1 "github.com/controlplaneio-fluxcd/flux-operator/api/v1"
+	kustomizev1 "github.com/fluxcd/kustomize-controller/api/v1"
 	sourcev1 "github.com/fluxcd/source-controller/api/v1"
+
+	"github.com/home-operations/flate/internal/assert"
 	"github.com/home-operations/flate/internal/testutil"
 	"github.com/home-operations/flate/pkg/manifest"
 )
@@ -241,7 +245,7 @@ func TestFilter_PinnedOwnershipKeepsProducer(t *testing.T) {
 	child := &manifest.Kustomization{Name: "child", Namespace: "apps", Path: "producers/child"}
 	consumer := &manifest.Kustomization{
 		Name: "consumer", Namespace: "apps", Path: "consumers",
-		PostBuildSubstituteFrom: []manifest.SubstituteReference{{Kind: manifest.KindConfigMap, Name: "settings"}},
+		PostBuild: &kustomizev1.PostBuild{SubstituteFrom: []manifest.SubstituteReference{{Kind: manifest.KindConfigMap, Name: "settings"}}},
 	}
 	cm := &manifest.ConfigMap{Name: "settings"}
 	files := map[manifest.NamedResource]string{
@@ -412,37 +416,11 @@ func TestFilter_KeepNamespaces(t *testing.T) {
 	}
 }
 
-func TestFilter_TransitiveDepsHelmRelease(t *testing.T) {
-	hr := &manifest.HelmRelease{
-		Name: "plex", Namespace: "media",
-		Chart: manifest.HelmChart{
-			RepoKind: manifest.KindOCIRepository, RepoName: "app-template", RepoNamespace: "flux-system",
-		},
-		ValuesFrom: []manifest.ValuesReference{
-			{Kind: manifest.KindConfigMap, Name: "plex-values"},
-		},
-	}
-	hrID := hr.Named()
-	repoID := manifest.NamedResource{Kind: manifest.KindOCIRepository, Namespace: "flux-system", Name: "app-template"}
-	cmID := manifest.NamedResource{Kind: manifest.KindConfigMap, Namespace: "media", Name: "plex-values"}
-
-	f := NewFilter(NewSet([]string{"hr.yaml"}), filterFixture{files: map[manifest.NamedResource]string{hrID: "hr.yaml"}, root: "", objects: testutil.MapLister{hrID: hr}}.index(), testutil.MapLister{hrID: hr})
-
-	if !f.ShouldReconcile(repoID) {
-		t.Errorf("chart source not pulled in by HR; keep=%v", f.KeepNames())
-	}
-	if !f.ShouldReconcile(cmID) {
-		t.Errorf("valuesFrom ref not pulled in by HR; keep=%v", f.KeepNames())
-	}
-}
-
 func TestFilter_TransitiveDepsKustomization(t *testing.T) {
 	ks := &manifest.Kustomization{
 		Name: "apps", Namespace: "flux-system",
-		SourceKind: manifest.KindGitRepository, SourceName: "flux-system", SourceNamespace: "flux-system",
-		DependsOn: []manifest.DependencyRef{{
-			Kind: manifest.KindKustomization, Namespace: "flux-system", Name: "repositories",
-		}},
+		SourceRef: kustomizev1.CrossNamespaceSourceReference{Kind: manifest.KindGitRepository, Name: "flux-system", Namespace: "flux-system"},
+		DependsOn: []kustomizev1.DependencyReference{{Namespace: "flux-system", Name: "repositories"}},
 	}
 	ksID := ks.Named()
 	gitID := manifest.NamedResource{Kind: manifest.KindGitRepository, Namespace: "flux-system", Name: "flux-system"}
@@ -450,14 +428,29 @@ func TestFilter_TransitiveDepsKustomization(t *testing.T) {
 
 	f := NewFilter(NewSet([]string{"ks.yaml"}), filterFixture{files: map[manifest.NamedResource]string{ksID: "ks.yaml"}, root: "", objects: testutil.MapLister{ksID: ks}}.index(), testutil.MapLister{ksID: ks})
 
-	if !f.ShouldReconcile(gitID) {
-		t.Errorf("sourceRef not pulled in by KS; keep=%v", f.KeepNames())
-	}
-	// dependsOn is reconcile-ordering only; unchanged ancestors must
-	// stay OUT of the keep set so offline diffs don't render unrelated
-	// trees.
-	if f.ShouldReconcile(depID) {
-		t.Errorf("dependsOn leaked into keep set; keep=%v", f.KeepNames())
+	assert.Equal(t, f.ShouldReconcile(gitID), true)
+	assert.Equal(t, f.ShouldReconcile(depID), false)
+}
+
+func TestFilter_ContentDependencies(t *testing.T) {
+	for _, tc := range []struct {
+		obj  manifest.BaseManifest
+		deps []manifest.NamedResource
+	}{
+		{&manifest.HelmRelease{Name: "plex", Namespace: "media", Chart: manifest.HelmChart{RepoKind: manifest.KindOCIRepository, RepoName: "app-template", RepoNamespace: "flux-system"}, ValuesFrom: []manifest.ValuesReference{{Kind: manifest.KindConfigMap, Name: "plex-values"}}}, []manifest.NamedResource{{Kind: manifest.KindOCIRepository, Namespace: "flux-system", Name: "app-template"}, {Kind: manifest.KindConfigMap, Namespace: "media", Name: "plex-values"}}},
+		{&manifest.GitRepository{Name: "source", Namespace: "apps", SecretRef: &manifest.LocalObjectReference{Name: "auth"}}, []manifest.NamedResource{{Kind: manifest.KindSecret, Namespace: "apps", Name: "auth"}}},
+		{&manifest.OCIRepository{Name: "source", Namespace: "apps", SecretRef: &manifest.LocalObjectReference{Name: "auth"}, CertSecretRef: &manifest.LocalObjectReference{Name: "cert"}}, []manifest.NamedResource{{Kind: manifest.KindSecret, Namespace: "apps", Name: "auth"}, {Kind: manifest.KindSecret, Namespace: "apps", Name: "cert"}}},
+		{&manifest.ResourceSet{Name: "set", Namespace: "apps", InputsFrom: []fluxopv1.InputProviderReference{{Name: "inputs"}}}, []manifest.NamedResource{{Kind: manifest.KindResourceSetInputProvider, Namespace: "apps", Name: "inputs"}}},
+		{&manifest.HelmChartSource{Name: "chart", Namespace: "apps", SourceRef: sourcev1.LocalHelmChartSourceReference{Name: "source"}}, []manifest.NamedResource{{Kind: manifest.KindHelmRepository, Namespace: "apps", Name: "source"}}},
+	} {
+		t.Run(tc.obj.Named().Kind, func(t *testing.T) {
+			objects := testutil.MapLister{tc.obj.Named(): tc.obj}
+			f := NewFilter(NewSet([]string{"changed.yaml"}), filterFixture{files: map[manifest.NamedResource]string{tc.obj.Named(): "changed.yaml"}, objects: objects}.index(), objects)
+			for _, id := range tc.deps {
+				assert.Equal(t, f.ShouldReconcile(id), true)
+			}
+			assert.Equal(t, f.ShouldReconcile(manifest.NamedResource{Kind: manifest.KindSecret, Namespace: "apps", Name: "unrelated"}), false)
+		})
 	}
 }
 
@@ -466,9 +459,9 @@ func TestFilter_DependsOnNotFollowed(t *testing.T) {
 	// drag `b` into the keep set just because `a` depends on `b`.
 	a := &manifest.Kustomization{
 		Name: "a", Namespace: "flux-system", Path: "./a",
-		SourceKind: manifest.KindGitRepository, SourceName: "src", SourceNamespace: "flux-system",
-		DependsOn: []manifest.DependencyRef{{
-			Kind: manifest.KindKustomization, Namespace: "flux-system", Name: "b",
+		SourceRef: kustomizev1.CrossNamespaceSourceReference{Kind: manifest.KindGitRepository, Name: "src", Namespace: "flux-system"},
+		DependsOn: []kustomizev1.DependencyReference{{
+			Namespace: "flux-system", Name: "b",
 		}},
 	}
 	b := &manifest.Kustomization{Name: "b", Namespace: "flux-system", Path: "./b"}
@@ -973,9 +966,9 @@ func TestFilter_SubstituteFromConfigMapKeepsProducerKustomization(t *testing.T) 
 	clusterAppsObj := &manifest.Kustomization{
 		Name: "cluster-apps", Namespace: "flux-system",
 		Path: "kubernetes/apps",
-		PostBuildSubstituteFrom: []manifest.SubstituteReference{
+		PostBuild: &kustomizev1.PostBuild{SubstituteFrom: []manifest.SubstituteReference{
 			{Kind: manifest.KindConfigMap, Name: "cluster-settings"},
-		},
+		}},
 	}
 	clusterVarsObj := &manifest.Kustomization{
 		Name: "cluster-vars", Namespace: "flux-system",
@@ -1055,9 +1048,9 @@ func TestFilter_AddEmittedKeepsSubstituteFromProducerDependencyOnly(t *testing.T
 	childObj := &manifest.Kustomization{
 		Name: "child-app", Namespace: "apps",
 		Path: "kubernetes/apps/child",
-		PostBuildSubstituteFrom: []manifest.SubstituteReference{
+		PostBuild: &kustomizev1.PostBuild{SubstituteFrom: []manifest.SubstituteReference{
 			{Kind: manifest.KindConfigMap, Name: "shared-settings"},
-		},
+		}},
 	}
 	child := childObj.Named()
 	producerObj := &manifest.Kustomization{
@@ -1108,9 +1101,9 @@ func TestFilter_AddEmittedReturnsSubstituteFromProducer(t *testing.T) {
 	childObj := &manifest.Kustomization{
 		Name: "child-app", Namespace: "apps",
 		Path: "kubernetes/apps/child",
-		PostBuildSubstituteFrom: []manifest.SubstituteReference{
+		PostBuild: &kustomizev1.PostBuild{SubstituteFrom: []manifest.SubstituteReference{
 			{Kind: manifest.KindConfigMap, Name: "shared-settings"},
-		},
+		}},
 	}
 	child := childObj.Named()
 	producerObj := &manifest.Kustomization{
@@ -1143,16 +1136,16 @@ func TestFilter_ChainedSubstituteFromProducers(t *testing.T) {
 	aObj := &manifest.Kustomization{
 		Name: "consumer", Namespace: "flux-system",
 		Path: "kubernetes/consumer",
-		PostBuildSubstituteFrom: []manifest.SubstituteReference{
+		PostBuild: &kustomizev1.PostBuild{SubstituteFrom: []manifest.SubstituteReference{
 			{Kind: manifest.KindConfigMap, Name: "cm-a"},
-		},
+		}},
 	}
 	bObj := &manifest.Kustomization{
 		Name: "producer-b", Namespace: "flux-system",
 		Path: "kubernetes/b",
-		PostBuildSubstituteFrom: []manifest.SubstituteReference{
+		PostBuild: &kustomizev1.PostBuild{SubstituteFrom: []manifest.SubstituteReference{
 			{Kind: manifest.KindConfigMap, Name: "cm-b"},
-		},
+		}},
 	}
 	cObj := &manifest.Kustomization{
 		Name: "producer-c", Namespace: "flux-system",
@@ -1192,9 +1185,9 @@ func TestFilter_SelfProducerSkippedInResolve(t *testing.T) {
 	selfObj := &manifest.Kustomization{
 		Name: "self", Namespace: "flux-system",
 		Path: "kubernetes/self",
-		PostBuildSubstituteFrom: []manifest.SubstituteReference{
+		PostBuild: &kustomizev1.PostBuild{SubstituteFrom: []manifest.SubstituteReference{
 			{Kind: manifest.KindConfigMap, Name: "self-settings"},
-		},
+		}},
 	}
 	self := selfObj.Named()
 	// CM lives at spec.path of self — so ownersOf returns self.
@@ -1276,7 +1269,7 @@ func TestFilter_SubstitutionGeneratorProducers(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			consumer := &manifest.Kustomization{Name: "consumer", Namespace: "apps", Path: "app",
-				PostBuildSubstituteFrom: []manifest.SubstituteReference{{Kind: tc.kind, Name: "settings", Optional: tc.optional}}}
+				PostBuild: &kustomizev1.PostBuild{SubstituteFrom: []manifest.SubstituteReference{{Kind: tc.kind, Name: "settings", Optional: tc.optional}}}}
 			producer := &manifest.Kustomization{Name: "producer", Namespace: "apps", Path: "data"}
 			data := manifest.NamedResource{Kind: tc.kind, Namespace: "apps", Name: "settings"}
 			index := &manifest.DiscoveryIndex{

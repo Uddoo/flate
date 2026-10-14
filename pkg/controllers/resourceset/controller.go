@@ -8,7 +8,6 @@
 package resourceset
 
 import (
-	"cmp"
 	"context"
 
 	"github.com/home-operations/flate/pkg/controllers/base"
@@ -151,21 +150,16 @@ func (c *Controller) emit(id manifest.NamedResource, docs []map[string]any, publ
 	// Route the RawObject (non-Flux) children to the orchestrator's output sink,
 	// reusing the shared parse so raw output groups under the parent KS.
 	for _, child := range children {
-		if _, raw := child.Obj.(*manifest.RawObject); raw {
+		if !manifest.KindOf(child.Obj).Tracked {
 			c.rawSink(id, parentKS, child.Doc)
 		}
 	}
 	return docs
 }
 
-// collectDeps assembles the dependency refs whose readiness must precede
-// this ResourceSet: explicit spec.dependsOn entries (carrying any CEL
-// ReadyExpr), each named spec.inputsFrom RSIP, and the structural parent
-// KS that renders us (so any parent-render-time spec mutations land
-// first). A selector-only inputsFrom (ref.Name == "") adds no id edge —
-// its matching RSIPs may be emitted by an unknown producer; the
-// drain-rerun mechanism (WantsDrainRerun) re-expands the RS at the
-// structural fixpoint instead.
+// collectDeps gates explicit dependencies, named inputs and the structural parent.
+// Authored dependsOn Ready=false still requests readiness here. Selector-only inputs
+// use the drain rerun because their producers have no nameable gate.
 func (c *Controller) collectDeps(rs *manifest.ResourceSet) []manifest.DependencyRef {
 	parent, hasParent := c.LookupParent(rs.Named())
 	capacity := len(rs.DependsOn) + len(rs.InputsFrom)
@@ -173,32 +167,15 @@ func (c *Controller) collectDeps(rs *manifest.ResourceSet) []manifest.Dependency
 		capacity++
 	}
 	deps := make([]manifest.DependencyRef, capacity)
-	for i, dep := range rs.DependsOn {
-		ns := cmp.Or(dep.Namespace, rs.Namespace)
-		if manifest.IsClusterScopedKind(dep.Kind) {
-			ns = ""
+	n := 0
+	for ref := range manifest.References(rs) {
+		if ref.Use == "dependsOn" || ref.Use == "inputsFrom" && ref.Name != "" {
+			deps[n] = ref.DependencyRef
+			n++
 		}
-		deps[i] = manifest.DependencyRef{
-			Kind: dep.Kind, Namespace: ns, Name: dep.Name,
-			ReadyExpr: dep.ReadyExpr,
-		}
-	}
-	n := len(rs.DependsOn)
-	for _, ref := range rs.InputsFrom {
-		if ref.Name == "" {
-			continue // selector-only: no nameable RSIP to park on
-		}
-		// InputProviderReference is same-namespace by spec — RSIPs live in
-		// the ResourceSet's own namespace.
-		deps[n].NamedResource = manifest.NamedResource{
-			Kind:      manifest.KindResourceSetInputProvider,
-			Namespace: rs.Namespace,
-			Name:      ref.Name,
-		}
-		n++
 	}
 	if hasParent {
-		deps[n].NamedResource = parent
+		deps[n] = manifest.DependencyRef{NamedResource: parent}
 		n++
 	}
 	return deps[:n]
@@ -216,8 +193,8 @@ func (c *Controller) WantsDrainRerun(id manifest.NamedResource) bool {
 	if !ok || rs.Suspend {
 		return false
 	}
-	for _, ref := range rs.InputsFrom {
-		if ref.Name == "" {
+	for ref := range manifest.References(rs) {
+		if ref.Use == "inputsFrom" && ref.Name == "" {
 			return true
 		}
 	}

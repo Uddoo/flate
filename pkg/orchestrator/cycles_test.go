@@ -2,22 +2,27 @@ package orchestrator
 
 import (
 	"fmt"
+	helmv2 "github.com/fluxcd/helm-controller/api/v2"
+	kustomizev1 "github.com/fluxcd/kustomize-controller/api/v1"
 	"io"
 	"log/slog"
 	"strings"
 	"testing"
 
 	"github.com/home-operations/flate/internal/assert"
-	"github.com/home-operations/flate/internal/testutil"
 	"github.com/home-operations/flate/pkg/manifest"
 	"github.com/home-operations/flate/pkg/store"
 )
 
 func makeKS(name, ns string, deps ...manifest.NamedResource) *manifest.Kustomization {
+	refs := make([]kustomizev1.DependencyReference, len(deps))
+	for i, dep := range deps {
+		refs[i] = kustomizev1.DependencyReference{Name: dep.Name, Namespace: dep.Namespace}
+	}
 	return &manifest.Kustomization{
 		Name: name, Namespace: ns,
 		Path:      "./" + name,
-		DependsOn: testutil.DepRefs(deps...),
+		DependsOn: refs,
 	}
 }
 
@@ -231,12 +236,12 @@ func TestUpdateDependencyGraphFor_HelmRelease(t *testing.T) {
 	o := &Orchestrator{store: store.New(), depGraph: newDependencyGraph()}
 	o.store.AddObject(&manifest.HelmRelease{
 		Name: "x", Namespace: "ns",
-		DependsOn: testutil.DepRefs(idY),
+		DependsOn: []helmv2.DependencyReference{{Name: idY.Name, Namespace: idY.Namespace}},
 	})
 	o.updateDependencyGraphFor(idX)
 	o.store.AddObject(&manifest.HelmRelease{
 		Name: "y", Namespace: "ns",
-		DependsOn: testutil.DepRefs(idX),
+		DependsOn: []helmv2.DependencyReference{{Name: idX.Name, Namespace: idX.Namespace}},
 	})
 	o.updateDependencyGraphFor(idY)
 
@@ -244,6 +249,26 @@ func TestUpdateDependencyGraphFor_HelmRelease(t *testing.T) {
 		if msg, ok := o.preflightFailure(id); !ok || !strings.Contains(msg, "dependency cycle detected") {
 			t.Fatalf("HR %s preflight = %q, %v", id, msg, ok)
 		}
+	}
+}
+
+func TestSameKindDepTargets_CallerBuffer(t *testing.T) {
+	for _, count := range []int{1, 8, 12} {
+		t.Run(fmt.Sprint(count), func(t *testing.T) {
+			want := make([]manifest.NamedResource, count)
+			for i := range want {
+				want[i] = manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: fmt.Sprint(i)}
+			}
+			ks := makeKS("app", "ns", want...)
+			var buf [8]manifest.NamedResource
+			assert.Diff(t, sameKindDepTargets(ks, buf[:0]), want)
+			if count <= len(buf) {
+				allocs := testing.AllocsPerRun(100, func() {
+					_ = sameKindDepTargets(ks, buf[:0])
+				})
+				assert.Equal(t, allocs, float64(0))
+			}
+		})
 	}
 }
 

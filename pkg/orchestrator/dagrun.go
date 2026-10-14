@@ -58,37 +58,19 @@ func (d dagDispatcher) reconcile(ctx context.Context, id schedule.NodeID, drainL
 	return schedule.OutcomeTerminal, nil
 }
 
-// dagSchedulable reports whether id is a node the scheduler runs
-// (Kustomization/HelmRelease/ResourceSet/source) versus pure data
-// (ConfigMap/Secret/RSIP) that only WAKES nodes parked on it. A
-// ResourceSetInputProvider is deliberately excluded: a render-emitted
-// RSIP fires EventObjectAdded to wake RSes parked on it, but it is not a
-// runnable node (flate exports its inputs statically, there is nothing to
-// reconcile).
-func (o *Orchestrator) dagSchedulable(id manifest.NamedResource) bool {
-	return isReconcilableKind(id.Kind) ||
-		id.Kind == manifest.KindResourceSet ||
-		o.src.Owns(id)
-}
-
 // seedNodes returns every file-loaded reconcilable + ResourceSet + source
 // object currently in the store — the scheduler's initial frontier.
 // ResourceSetInputProviders are NOT seeded: they are pure data, not
-// runnable nodes (see dagSchedulable).
+// runnable nodes according to the manifest kind table.
 func (o *Orchestrator) seedNodes() []manifest.NamedResource {
 	var ids []manifest.NamedResource
-	for _, kind := range reconcilableKinds {
-		for _, obj := range o.store.ListObjects(kind) {
-			ids = append(ids, obj.Named())
+	for info := range manifest.Kinds() {
+		if !info.Runnable {
+			continue
 		}
-	}
-	for _, obj := range o.store.ListObjects(manifest.KindResourceSet) {
-		ids = append(ids, obj.Named())
-	}
-	for kind := range o.src.Fetchers {
-		for _, obj := range o.store.ListObjects(kind) {
-			if id := obj.Named(); o.src.Owns(id) {
-				ids = append(ids, id)
+		for _, obj := range o.store.ListObjects(info.Kind) {
+			if o.schedulable(obj) {
+				ids = append(ids, obj.Named())
 			}
 		}
 	}
@@ -112,6 +94,21 @@ func (o *Orchestrator) runDAG(ctx context.Context) error {
 	o.hrc.Start(ctx)
 	o.rsc.StartLifecycle()
 
+	unsubscribe := o.watchDAG(sched)
+	defer unsubscribe()
+
+	sched.Seed(o.seedNodes())
+	err := sched.Run(ctx)
+
+	return errors.Join(err, o.finalize())
+}
+
+func (o *Orchestrator) schedulable(obj manifest.BaseManifest) bool {
+	info := manifest.KindOf(obj)
+	return info.Runnable && (info.Group != manifest.SourceDomain || o.src.Owns(obj.Named()))
+}
+
+func (o *Orchestrator) watchDAG(sched *schedule.Scheduler) func() {
 	// Store → scheduler adapters (fire-only, flush=false), registered AFTER the
 	// shared cycle-detect listener so cycle preflight runs first.
 	//
@@ -121,10 +118,10 @@ func (o *Orchestrator) runDAG(ctx context.Context) error {
 	//   resurrection. The listener runs OUTSIDE the store shard lock (AddObject
 	//   fires it post-unlock), and sched.OnArrival only updates
 	//   scheduler state, so there is no store-lock ↔ sched.mu inversion.
-	unsubAdd := o.store.AddListener(store.EventObjectAdded, func(id manifest.NamedResource, _ any) {
-		sched.OnArrival(id, o.dagSchedulable(id))
+	unsubAdd := o.store.AddListener(store.EventObjectAdded, func(id manifest.NamedResource, payload any) {
+		obj, _ := payload.(manifest.BaseManifest)
+		sched.OnArrival(id, o.schedulable(obj))
 	}, false)
-	defer unsubAdd()
 	//   EventStatusUpdated: wake nodes parked on a dep that reached a terminal
 	//   status. Non-terminal (Pending) updates return before the scheduler lock.
 	unsubStatus := o.store.AddListener(store.EventStatusUpdated, func(id manifest.NamedResource, payload any) {
@@ -134,10 +131,9 @@ func (o *Orchestrator) runDAG(ctx context.Context) error {
 		}
 		sched.OnStatusWake(id, info.Status == store.StatusReady, info.Status == store.StatusFailed)
 	}, false)
-	defer unsubStatus()
 
-	sched.Seed(o.seedNodes())
-	err := sched.Run(ctx)
-
-	return errors.Join(err, o.finalize())
+	return func() {
+		unsubStatus()
+		unsubAdd()
+	}
 }

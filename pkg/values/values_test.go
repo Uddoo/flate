@@ -10,7 +10,9 @@ import (
 
 	"helm.sh/helm/v4/pkg/chart/v2/loader"
 
+	kustomizev1 "github.com/fluxcd/kustomize-controller/api/v1"
 	"github.com/home-operations/flate/internal/assert"
+
 	"github.com/home-operations/flate/pkg/manifest"
 )
 
@@ -399,13 +401,16 @@ func TestExpandPostBuildSubstituteReference(t *testing.T) {
 	ks := &manifest.Kustomization{
 		Name: "apps", Namespace: "flux-system",
 		Contents: map[string]any{"spec": map[string]any{}},
-		PostBuildSubstituteFrom: []manifest.SubstituteReference{
+		PostBuild: &kustomizev1.PostBuild{SubstituteFrom: []manifest.SubstituteReference{
+			{Kind: "Unsupported", Name: "vars"},
 			{Kind: "ConfigMap", Name: "vars"},
-		},
+		}},
 	}
+	postBuild := ks.PostBuild
 	if err := ExpandPostBuildSubstituteReference(ks, provider); err != nil {
 		t.Fatalf("ExpandPostBuildSubstituteReference: %v", err)
 	}
+	assert.Equal(t, ks.PostBuild, postBuild)
 	if ks.PostBuildSubstitute["DOMAIN"] != "example.com" {
 		t.Errorf("substitute: %+v", ks.PostBuildSubstitute)
 	}
@@ -420,9 +425,9 @@ func TestExpandPostBuildSubstituteReference_MalformedDataLeavesSubstitutionsUnto
 			}
 			ks := &manifest.Kustomization{
 				Name: "app", Namespace: "ns",
-				PostBuildSubstitute:     map[string]any{"INLINE": "kept"},
-				PostBuildSubstituteFrom: []manifest.SubstituteReference{{Kind: kind, Name: "vars"}},
-				Contents:                map[string]any{"spec": map[string]any{}},
+				PostBuildSubstitute: map[string]any{"INLINE": "kept"},
+				PostBuild:           &kustomizev1.PostBuild{SubstituteFrom: []manifest.SubstituteReference{{Kind: kind, Name: "vars"}}},
+				Contents:            map[string]any{"spec": map[string]any{}},
 			}
 			if err := ExpandPostBuildSubstituteReference(ks, provider); !errors.Is(err, manifest.ErrInput) {
 				t.Fatalf("got %v, want ErrInput", err)
@@ -436,7 +441,7 @@ func TestExpandPostBuildSubstituteReference_MalformedDataLeavesSubstitutionsUnto
 func TestExpandPostBuildSubstituteReference_MalformedKeysDeterministic(t *testing.T) {
 	sec := &manifest.Secret{Name: "vars", Namespace: "ns", Data: map[string]any{"C": "!", "A": "!", "B": "!"}}
 	provider := &SliceProvider{Secrets: []*manifest.Secret{sec}}
-	ks := &manifest.Kustomization{Name: "app", Namespace: "ns", PostBuildSubstituteFrom: []manifest.SubstituteReference{{Kind: manifest.KindSecret, Name: "vars"}}}
+	ks := &manifest.Kustomization{Name: "app", Namespace: "ns", PostBuild: &kustomizev1.PostBuild{SubstituteFrom: []manifest.SubstituteReference{{Kind: manifest.KindSecret, Name: "vars"}}}}
 	_, _, want := sec.Value("A")
 	for range 50 {
 		err := ExpandPostBuildSubstituteReference(ks, provider)
@@ -455,7 +460,7 @@ func TestExpandPostBuildSubstituteReference_RejectsInvalidVarName(t *testing.T) 
 			if source == "inline" {
 				ks.PostBuildSubstitute = vars
 			} else {
-				ks.PostBuildSubstituteFrom = []manifest.SubstituteReference{{Kind: manifest.KindConfigMap, Name: "cm"}}
+				ks.PostBuild = &kustomizev1.PostBuild{SubstituteFrom: []manifest.SubstituteReference{{Kind: manifest.KindConfigMap, Name: "cm"}}}
 				provider.ConfigMaps = []*manifest.ConfigMap{{Name: "cm", Namespace: "ns", Data: vars}}
 			}
 
@@ -485,13 +490,13 @@ func TestUnreadableSubstituteSecrets(t *testing.T) {
 	}
 	ks := &manifest.Kustomization{
 		Name: "apps", Namespace: "flux-system",
-		PostBuildSubstituteFrom: []manifest.SubstituteReference{
+		PostBuild: &kustomizev1.PostBuild{SubstituteFrom: []manifest.SubstituteReference{
 			{Kind: manifest.KindSecret, Name: "absent-vars"},                // unreadable → reported
 			{Kind: manifest.KindSecret, Name: "sops-vars"},                  // placeholder data → readable
 			{Kind: manifest.KindSecret, Name: "real"},                       // real data → readable
 			{Kind: manifest.KindConfigMap, Name: "cm"},                      // not a Secret → skipped
 			{Kind: manifest.KindSecret, Name: "opt-absent", Optional: true}, // optional → skipped
-		},
+		}},
 	}
 	if got, want := UnreadableSubstituteSecrets(ks, provider), []string{"absent-vars"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("UnreadableSubstituteSecrets = %v, want %v", got, want)

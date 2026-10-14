@@ -4,6 +4,8 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+
+	kustomizev1 "github.com/fluxcd/kustomize-controller/api/v1"
 )
 
 func TestBuildKSClaims_PathsAndComponents(t *testing.T) {
@@ -19,7 +21,7 @@ func TestBuildKSClaims_PathsAndComponents(t *testing.T) {
 		{name: "outside", path: "./apps", component: "../../outside", want: []string{"apps/"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			ks := &Kustomization{Name: "root", Path: tc.path, SourceName: tc.source, Components: []string{tc.component}}
+			ks := &Kustomization{Name: "root", Path: tc.path, SourceRef: kustomizev1.CrossNamespaceSourceReference{Name: tc.source}, Components: []string{tc.component}}
 			claims := BuildKSClaims([]*Kustomization{ks}, nil)
 			var prefixes []string
 			for _, claim := range claims {

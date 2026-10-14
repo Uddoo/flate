@@ -10,6 +10,7 @@ import (
 	"time"
 
 	helmv2 "github.com/fluxcd/helm-controller/api/v2"
+	kustomizev1 "github.com/fluxcd/kustomize-controller/api/v1"
 	sourcev1 "github.com/fluxcd/source-controller/api/v1"
 	"github.com/home-operations/flate/internal/assert"
 	"github.com/home-operations/flate/internal/testutil"
@@ -59,7 +60,7 @@ func TestController_CollectHRDepsOrderingFilter(t *testing.T) {
 				}
 				changes = change.NewSet(files)
 			}
-			hr := &manifest.HelmRelease{Name: "consumer", Namespace: "apps", DependsOn: []manifest.DependencyRef{{NamedResource: target.Named(), ReadyExpr: "dep.spec.suspend == false"}}}
+			hr := &manifest.HelmRelease{Name: "consumer", Namespace: "apps", DependsOn: []helmv2.DependencyReference{{Name: target.Name, Namespace: target.Namespace, ReadyExpr: "dep.spec.suspend == false"}}}
 			filter := change.NewFilter(changes, &manifest.DiscoveryIndex{Records: map[manifest.NamedResource]manifest.DiscoveryRecord{hr.Named(): {File: "consumer.yaml"}, target.Named(): {File: "target.yaml"}}}, testutil.MapLister{})
 			c, st := newTestControllerWithOptions(t, ReconcileOptions{Filter: filter, Existence: indexedOrderingDeps{target.Named(): tc.indexed}})
 			if tc.present {
@@ -67,10 +68,11 @@ func TestController_CollectHRDepsOrderingFilter(t *testing.T) {
 				st.UpdateStatus(target.Named(), tc.status, "fixture")
 			}
 			size := len(filter.KeepNames())
-			deps := c.OrderingDeps(hr.DependsOn)
-			if got := slices.Contains(deps, hr.DependsOn[0]); got != tc.retain {
-				t.Errorf("ordering edge retained = %v, want %v; deps = %v", got, tc.retain, deps)
+			want := []manifest.DependencyRef{}
+			if tc.retain {
+				want = []manifest.DependencyRef{{NamedResource: target.Named(), ReadyExpr: "dep.spec.suspend == false"}}
 			}
+			assert.Diff(t, c.collectDeps(hr), want)
 			if len(filter.KeepNames()) != size || len(hr.DependsOn) != 1 {
 				t.Error("ordering collection must preserve keep and input edges")
 			}
@@ -227,7 +229,7 @@ func TestMaterializeHelmChartSource_SharedSourceCompletes(t *testing.T) {
 				}
 				first := *consumers[0]
 				c.materializeHelmChartSource(first.Named(), &first)
-				source := chartSourceID(&first)
+				source := (manifest.NamedResource{Kind: first.Chart.RepoKind, Namespace: first.Chart.RepoNamespace, Name: first.Chart.RepoName})
 				sourceStarted := make(chan struct{})
 				sourceRelease := make(chan struct{})
 				parked := make(chan manifest.NamedResource, len(consumers))
@@ -265,8 +267,8 @@ func TestMaterializeHelmChartSource_SharedSourceCompletes(t *testing.T) {
 				}
 				second := *consumers[1]
 				c.materializeHelmChartSource(second.Named(), &second)
-				if chartSourceID(&second) != source {
-					t.Errorf("second source = %s, want shared %s", chartSourceID(&second), source)
+				if (manifest.NamedResource{Kind: second.Chart.RepoKind, Namespace: second.Chart.RepoNamespace, Name: second.Chart.RepoName}) != source {
+					t.Errorf("second source = %s, want shared %s", (manifest.NamedResource{Kind: second.Chart.RepoKind, Namespace: second.Chart.RepoNamespace, Name: second.Chart.RepoName}), source)
 				}
 				if info, ok := st.GetStatus(source); ok {
 					t.Errorf("consumer wrote synthetic status = %+v, want no Ready condition", info)
@@ -1022,49 +1024,12 @@ func TestRawProducerIndex_NamespaceIsolation(t *testing.T) {
 
 func TestController_CollectHRDepsClone(t *testing.T) {
 	c, _ := newTestController(t, nil)
-	hr := &manifest.HelmRelease{
-		Name: "demo", Namespace: "default",
-		DependsOn: []manifest.DependencyRef{
-			{Kind: manifest.KindHelmRelease, Namespace: "default", Name: "other"},
-		},
-	}
-	got := c.OrderingDeps(hr.DependsOn)
-	if len(got) != 1 || got[0].Name != "other" {
-		t.Fatalf("OrderingDeps = %+v", got)
-	}
-	// Mutating the returned slice must not affect hr.DependsOn.
+	hr := &manifest.HelmRelease{Name: "demo", Namespace: "default", DependsOn: []helmv2.DependencyReference{{Namespace: "default", Name: "other"}, {Name: "second"}, {Name: "third"}}}
+	assert.Equal(t, testing.AllocsPerRun(100, func() { c.collectDeps(hr) }), float64(1))
+	got := c.collectDeps(hr)
+	assert.Diff(t, got, []manifest.DependencyRef{{Kind: manifest.KindHelmRelease, Namespace: "default", Name: "other"}, {Kind: manifest.KindHelmRelease, Namespace: "default", Name: "second"}, {Kind: manifest.KindHelmRelease, Namespace: "default", Name: "third"}})
 	got[0].Name = "mutated"
-	if hr.DependsOn[0].Name == "mutated" {
-		t.Errorf("OrderingDeps did not return a defensive copy")
-	}
-}
-
-func TestController_CollectHRDepsPrunesUnchangedDeps(t *testing.T) {
-	// #517: in changed-only mode a changed HR's dependsOn on an UNCHANGED
-	// dep must be pruned. The unchanged dep's producing Kustomization is
-	// skipped, so the dep HR is never render-emitted into the Store and
-	// depwait would spuriously fail "dependency not found". Build a filter
-	// whose keep-set contains qbittorrent (its file changed) but not
-	// prowlarr (unchanged): only the in-keep dep survives.
-	qbit := manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: "downloads", Name: "qbittorrent"}
-	prowlarr := manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: "downloads", Name: "prowlarr"}
-	filter := change.NewFilter(change.NewSet([]string{"qbittorrent.yaml"}), &manifest.DiscoveryIndex{Records: map[manifest.NamedResource]manifest.DiscoveryRecord{qbit: {File: "qbittorrent.yaml"}, prowlarr: {File: "prowlarr.yaml"}}}, testutil.MapLister{})
-	c, st := newTestController(t, filter)
-	st.AddObject(&manifest.HelmRelease{Name: prowlarr.Name, Namespace: prowlarr.Namespace})
-	hr := &manifest.HelmRelease{
-		Name: "lidarr", Namespace: "downloads",
-		DependsOn: []manifest.DependencyRef{{NamedResource: qbit}, {NamedResource: prowlarr}},
-	}
-	got := c.OrderingDeps(hr.DependsOn)
-	if len(got) != 1 || got[0].NamedResource != qbit {
-		t.Fatalf("OrderingDeps = %+v; want only the in-keep qbittorrent dep", got)
-	}
-
-	// Sanity: a disabled filter (full mode) prunes nothing.
-	cFull, _ := newTestController(t, nil)
-	if got := cFull.OrderingDeps(hr.DependsOn); len(got) != 2 {
-		t.Errorf("disabled filter must not prune; OrderingDeps = %+v", got)
-	}
+	assert.Equal(t, hr.DependsOn[0].Name, "other")
 }
 
 // TestController_AlreadyReady_NoTransientPending pins the base
@@ -1135,5 +1100,39 @@ func TestController_AlreadyReady_NoTransientPending(t *testing.T) {
 	}
 	if info, _ := st.GetStatus(hr.Named()); info.Status != store.StatusReady {
 		t.Errorf("HR not Ready after no-op re-run: %+v", info)
+	}
+}
+
+func TestController_ParentReadsUnreadableSecret_ReferencePositions(t *testing.T) {
+	parent := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "apps", Name: "parent"}
+	c, st := newTestControllerWithOptions(t, ReconcileOptions{ParentOf: func(manifest.NamedResource) (manifest.NamedResource, bool) { return parent, true }})
+	ks := &manifest.Kustomization{Name: parent.Name, Namespace: parent.Namespace}
+	ks.PostBuild = &kustomizev1.PostBuild{SubstituteFrom: []manifest.SubstituteReference{{Kind: "Unsupported"}, {Kind: manifest.KindSecret, Name: "owned"}, {Kind: manifest.KindSecret, Name: "unreadable"}}}
+	st.AddObject(ks)
+	assert.Equal(t, c.parentReadsUnreadableSecret(manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: "apps", Name: "app"}), true)
+	c.substitutionSources = map[manifest.NamedResource]manifest.BaseManifest{
+		{Kind: manifest.KindSecret, Namespace: "apps", Name: "owned"}:      &manifest.Secret{},
+		{Kind: manifest.KindSecret, Namespace: "apps", Name: "unreadable"}: &manifest.Secret{},
+	}
+	assert.Equal(t, c.parentReadsUnreadableSecret(manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: "apps", Name: "app"}), false)
+	assert.Equal(t, len(ks.PostBuild.SubstituteFrom), 3)
+}
+
+func TestController_ChartAndValuesPrerequisites(t *testing.T) {
+	c, st := newTestController(t, nil)
+	hr := &manifest.HelmRelease{Name: "app", Namespace: "apps", ChartRef: &helmv2.CrossNamespaceSourceReference{Kind: manifest.KindOCIRepository, Name: "chart"}}
+	st.AddObject(&manifest.OCIRepository{Name: "chart", Namespace: "apps"})
+	st.UpdateStatus(manifest.NamedResource{Kind: manifest.KindOCIRepository, Name: "chart", Namespace: "apps"}, store.StatusPending, "fetching")
+	_, blocked := errors.AsType[*depwait.ErrBlocked](c.awaitChartSource(t.Context(), hr, manifest.DrainNone))
+	assert.Equal(t, blocked, true)
+	hr.ChartRef.Kind = manifest.KindHelmChart
+	hr.ValuesFrom = []manifest.ValuesReference{{Kind: manifest.KindConfigMap, Name: "optional", Optional: true}, {Kind: manifest.KindSecret, Name: "required"}}
+	for _, version := range []string{"", "1.0.0"} {
+		hr.Chart.Version = version
+		want := []manifest.DependencyRef{{Kind: manifest.KindSecret, Namespace: "apps", Name: "required"}}
+		if version == "" {
+			want = append([]manifest.DependencyRef{{Kind: manifest.KindHelmChart, Namespace: "apps", Name: "chart"}}, want...)
+		}
+		assert.Diff(t, preparePrereqs(hr), want)
 	}
 }

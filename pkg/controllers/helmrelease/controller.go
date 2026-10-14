@@ -174,7 +174,7 @@ func (c *Controller) reconcile(ctx context.Context, hr *manifest.HelmRelease, le
 
 	// Honor spec.dependsOn — HR-to-HR ordering. Flux gates rendering on
 	// each dependency reaching Ready before this HR reconciles.
-	if deps := c.OrderingDeps(hr.DependsOn); len(deps) > 0 {
+	if deps := c.collectDeps(hr); len(deps) > 0 {
 		c.Store.UpdateStatus(id, store.StatusPending, "resolving dependencies")
 		// RequireRefresh fuses the dependsOn gate with the load-bearing
 		// re-read: the parent KS may have re-rendered (e.g. its own
@@ -372,40 +372,64 @@ func (c *Controller) parentReadsUnreadableSecret(id manifest.NamedResource) bool
 	if !ok {
 		return false
 	}
-	if len(c.substitutionSources) > 0 {
-		owned := *ks
-		owned.PostBuildSubstituteFrom = slices.DeleteFunc(slices.Clone(ks.PostBuildSubstituteFrom), func(ref manifest.SubstituteReference) bool {
-			return c.substitutionSources[manifest.NamedResource{Kind: ref.Kind, Namespace: ks.Namespace, Name: ref.Name}] != nil
-		})
-		ks = &owned
+	if len(c.substitutionSources) > 0 && ks.PostBuild != nil {
+		var positions []int
+		for ref := range manifest.References(ks) {
+			if ref.Use == "substituteFrom" && c.substitutionSources[ref.NamedResource] != nil {
+				positions = append(positions, ref.Position)
+			}
+		}
+		if len(positions) > 0 {
+			owned := ks.Clone()
+			for _, position := range slices.Backward(positions) {
+				owned.PostBuild.SubstituteFrom = slices.Delete(owned.PostBuild.SubstituteFrom, position, position+1)
+			}
+			ks = owned
+		}
 	}
 	return len(values.UnreadableSubstituteSecrets(ks, values.NewStoreProvider(c.Store))) > 0
 }
 
-// chartSourceID is the resource identity of the HelmRelease's current chart
-// source (the thing its render reads from).
-func chartSourceID(hr *manifest.HelmRelease) manifest.NamedResource {
-	return manifest.NamedResource{
-		Kind: hr.Chart.RepoKind, Namespace: hr.Chart.RepoNamespace, Name: hr.Chart.RepoName,
+// collectDeps selects ordering gates in one walk, pruning only known unchanged refs.
+func (c *Controller) collectDeps(hr *manifest.HelmRelease) []manifest.DependencyRef {
+	var deps []manifest.DependencyRef
+	if len(hr.DependsOn) > 0 {
+		deps = make([]manifest.DependencyRef, 0, len(hr.DependsOn))
 	}
+	manifest.References(hr)(func(ref manifest.Reference) bool {
+		if ref.Use == "dependsOn" && c.KeepOrderingDep(ref.NamedResource) {
+			deps = append(deps, ref.DependencyRef)
+		}
+		return true
+	})
+	return deps
 }
 
-// awaitChartSource gates hr on its current chart source reaching Ready, then
-// propagates a soft-skip (--allow-missing-secrets on the source's auth marks it
-// Ready but writes no artifact, so fail here rather than letting the render fail
-// later with a confusing chart-not-found).
-//
-// The chart source is a status-bearing dependency that flate itself fetches
-// (synthetic HelmChart, declared OCIRepository/GitRepository/HelmChart). It is
-// gated via Require: an unready source classifies as blocked, so the scheduler
-// parks this node and re-runs it when the fetch completes — a slow fetch is
-// waited for by OUTCOME instead of dropped.
+// awaitChartSource prefers the resolved source to the authored chart and propagates
+// source soft skips. Require parks on fetch completion before chart lookup.
 func (c *Controller) awaitChartSource(ctx context.Context, hr *manifest.HelmRelease, level manifest.DrainLevel) error {
-	srcID := chartSourceID(hr)
-	if err := c.Require(ctx, hr.Named(), []manifest.DependencyRef{{NamedResource: srcID}}, level); err != nil {
+	var deps []manifest.DependencyRef
+	var chart manifest.DependencyRef
+	for ref := range manifest.References(hr) {
+		switch ref.Use {
+		case "source":
+			deps = append(deps, ref.DependencyRef)
+		case "chart":
+			chart = ref.DependencyRef
+		}
+	}
+	if len(deps) == 0 {
+		deps = append(deps, chart)
+	}
+	if err := c.Require(ctx, hr.Named(), deps, level); err != nil {
 		return err
 	}
-	return c.SourceSkipped(srcID, "chart source")
+	for _, dep := range deps {
+		if err := c.SourceSkipped(dep.NamedResource, "chart source"); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // materializeHelmChartSource handles a HelmRelease whose chart source is a
@@ -444,35 +468,21 @@ func (c *Controller) materializeHelmChartSource(id manifest.NamedResource, hr *m
 	return hr, true
 }
 
-// preparePrereqs collects refs that helm.Prepare reads from the live
-// Store via synchronous lookup. The Store is mutated by other
-// controllers (parent KS emit, sibling KS render), so a HR observed
-// before its referenced HelmChart CRD / valuesFrom CM/Secret would
-// hard-fail in Prepare with ErrObjectNotFound. Pre-await each ref's
-// existence so the lookup is guaranteed to land.
-//
-// Excluded: Optional valuesFrom refs (Prepare tolerates their
-// absence) and the chart source itself (already awaited explicitly
-// after Prepare since it needs Ready, not just exists).
+// preparePrereqs gates synchronous Prepare lookups against concurrent parent emits.
+// Optional values are excluded; chart sources needing fetch readiness are gated later.
 func preparePrereqs(hr *manifest.HelmRelease) []manifest.DependencyRef {
 	var out []manifest.DependencyRef
-
-	// chartRef → HelmChart CRD: the unresolved Name=="" placeholder
-	// shape (chartFromHelmRelease leaves Name empty for HelmChart
-	// chartRefs); Prepare's ResolveChartRef would synchronously read
-	// the HelmChartSource from the store to materialize it.
-	if hr.Chart.RepoKind == manifest.KindHelmChart && hr.Chart.Version == "" {
-		out = append(out, manifest.DependencyRef{
-			Kind: manifest.KindHelmChart, Namespace: hr.Chart.RepoNamespace, Name: hr.Chart.RepoName})
-	}
-
-	for _, ref := range hr.ValuesFrom {
-		if ref.Optional {
-			continue
+	for ref := range manifest.References(hr) {
+		switch ref.Use {
+		case "chart", "source":
+			if ref.Kind == manifest.KindHelmChart && hr.Chart.Version == "" {
+				out = append(out, ref.DependencyRef)
+			}
+		case "valuesFrom":
+			if !ref.Optional {
+				out = append(out, ref.DependencyRef)
+			}
 		}
-		out = append(out, manifest.DependencyRef{
-			Kind: ref.Kind, Namespace: hr.Namespace, Name: ref.Name})
 	}
-
 	return out
 }

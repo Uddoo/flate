@@ -35,16 +35,21 @@ func parseHelmRepository(doc map[string]any) (*HelmRepository, error) {
 		return nil, inputf("HelmRepository missing spec.url")
 	}
 	cr.Spec.Type = cmp.Or(cr.Spec.Type, sourcev1.HelmRepositoryTypeDefault)
-	owner := cr.Namespace + "/" + cr.Name
-	if err := validateOptionalRefs("HelmRepository", owner,
-		secretRefCheck{Field: "spec.secretRef", Ref: cr.Spec.SecretRef},
-		secretRefCheck{Field: "spec.certSecretRef", Ref: cr.Spec.CertSecretRef},
-	); err != nil {
-		return nil, err
-	}
-	return &HelmRepository{
+	out := &HelmRepository{
 		Name:               cr.Name,
 		Namespace:          cr.Namespace,
 		HelmRepositorySpec: cr.Spec,
-	}, nil
+	}
+	var err error
+	out.references(validateSecretReference(out.Named(), &err))
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
+
+func (h *HelmRepository) references(yield func(Reference) bool) {
+	credentialReferences(yield, h.Namespace, h.SecretRef, h.CertSecretRef)
+}
+
+func (h *HelmRepository) kind() KindInfo { return kindTable[kindHelmRepository].KindInfo }

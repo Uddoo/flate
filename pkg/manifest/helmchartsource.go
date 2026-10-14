@@ -42,3 +42,12 @@ func parseHelmChartSource(doc map[string]any) (*HelmChartSource, error) {
 		HelmChartSpec: cr.Spec,
 	}, nil
 }
+
+func (h *HelmChartSource) references(yield func(Reference) bool) {
+	yield(Reference{
+		Kind: cmp.Or(h.SourceRef.Kind, KindHelmRepository), Namespace: h.Namespace, Name: h.SourceRef.Name,
+		Use: "source", Content: h.SourceRef.Name != "",
+	})
+}
+
+func (h *HelmChartSource) kind() KindInfo { return kindTable[kindHelmChartSource].KindInfo }

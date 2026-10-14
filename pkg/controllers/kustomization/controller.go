@@ -121,10 +121,10 @@ func (c *Controller) reconcile(ctx context.Context, ks *manifest.Kustomization, 
 		fresh, ok, err := c.RequireRefresh[*manifest.Kustomization](
 			ctx, id, deps, level)
 		if err != nil {
-			ref := manifest.NamedResource{Kind: ks.SourceKind, Namespace: ks.SourceNamespace, Name: ks.SourceName}
+			ref := ks.SourceID()
 			_, blocked := errors.AsType[*depwait.ErrBlocked](err)
 			_, failed := errors.AsType[*manifest.DependencyFailedError](err)
-			if (blocked || failed) && level >= manifest.DrainCascade && ks.SourceKind == manifest.KindOCIRepository && c.Store.GetObject(ref) == nil && c.Store.GetArtifact(ref) == nil {
+			if (blocked || failed) && level >= manifest.DrainCascade && ref.Kind == manifest.KindOCIRepository && c.Store.GetObject(ref) == nil && c.Store.GetArtifact(ref) == nil {
 				return fmt.Errorf("%w: source %s has an unknown OCI artifact root", manifest.ErrInput, ref)
 			}
 			return err
@@ -243,37 +243,54 @@ func (c *Controller) reconcile(ctx context.Context, ks *manifest.Kustomization, 
 	return nil
 }
 
-// collectDeps orders explicit dependencies, sources, structural parents and
-// substitution data producers before the consumer reads their rendered data.
-// Secrets are not hard data edges: SOPS/ExternalSecret inputs may exist only in cluster state.
+// collectDeps preserves dependsOn, parent, source, then data/producer gate order.
+// Secrets have no direct hard gate: SOPS/ExternalSecret data may exist only in-cluster.
 func (c *Controller) collectDeps(ks *manifest.Kustomization) []manifest.DependencyRef {
-	deps := c.OrderingDeps(ks.DependsOn)
-	if ks.SourceKind != "" && ks.SourceName != "" {
-		deps = append(deps, manifest.DependencyRef{
-			Kind: ks.SourceKind, Namespace: ks.SourceNamespace, Name: ks.SourceName,
-		})
+	var deps []manifest.DependencyRef
+	if len(ks.DependsOn) > 0 {
+		deps = make([]manifest.DependencyRef, 0, len(ks.DependsOn))
 	}
-	if parent, ok := c.LookupParent(ks.Named()); ok {
-		deps = append(deps, manifest.DependencyRef{NamedResource: parent})
+	var source manifest.DependencyRef
+	flushed := false
+	flush := func() {
+		if parent, ok := c.LookupParent(ks.Named()); ok {
+			deps = append(deps, manifest.DependencyRef{NamedResource: parent})
+		}
+		if source.Kind != "" && source.Name != "" {
+			deps = append(deps, source)
+		}
+		flushed = true
 	}
-	for _, ref := range ks.PostBuildSubstituteFrom {
-		if !manifest.IsSubstituteDataRef(ref) {
-			continue
+	manifest.References(ks)(func(ref manifest.Reference) bool {
+		switch ref.Use {
+		case "source":
+			source = ref.DependencyRef
+		case "dependsOn":
+			if c.KeepOrderingDep(ref.NamedResource) {
+				deps = append(deps, ref.DependencyRef)
+			}
+		case "substituteFrom":
+			if !flushed {
+				flush()
+			}
+			if ref.Optional || ref.Name == "" || c.substitutionSources[ref.NamedResource] != nil {
+				return true
+			}
+			producers := c.index.DataProducers(ref.NamedResource)
+			if slices.Contains(producers, ks.Named()) {
+				return true
+			}
+			if ref.Kind == manifest.KindConfigMap {
+				deps = append(deps, ref.DependencyRef)
+			}
+			for _, producer := range producers {
+				deps = append(deps, manifest.DependencyRef{NamedResource: producer})
+			}
 		}
-		depID := manifest.NamedResource{Kind: ref.Kind, Namespace: ks.Namespace, Name: ref.Name}
-		if c.substitutionSources[depID] != nil {
-			continue
-		}
-		producers := c.index.DataProducers(depID)
-		if slices.Contains(producers, ks.Named()) {
-			continue
-		}
-		if ref.Kind == manifest.KindConfigMap {
-			deps = append(deps, manifest.DependencyRef{NamedResource: depID})
-		}
-		for _, producer := range producers {
-			deps = append(deps, manifest.DependencyRef{NamedResource: producer})
-		}
+		return true
+	})
+	if !flushed {
+		flush()
 	}
 	return deps
 }
@@ -292,8 +309,8 @@ func (c *Controller) collectDeps(ks *manifest.Kustomization) []manifest.Dependen
 // working-tree aliases are the only artifacts that set neither Revision nor
 // Digest, which is precisely the signal.
 func (c *Controller) resolveSource(ks *manifest.Kustomization) (*store.SourceArtifact, bool, error) {
-	srcID := manifest.NamedResource{Kind: ks.SourceKind, Namespace: ks.SourceNamespace, Name: ks.SourceName}
-	if ks.SourceKind == "" || ks.SourceName == "" {
+	srcID := ks.SourceID()
+	if srcID.Kind == "" || srcID.Name == "" {
 		// Child Kustomizations that inherit sourceRef from a parent's
 		// render patches show empty here until that parent reconciles.
 		// Fall back to the seeded bootstrap GitRepository (the user's

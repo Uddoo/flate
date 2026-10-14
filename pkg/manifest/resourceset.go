@@ -1,6 +1,7 @@
 package manifest
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 
@@ -158,4 +159,33 @@ func (p *ResourceSetInputProvider) derivedID() string {
 	// First 8 bytes (16 hex chars) of the full digest — enough to
 	// uniquely identify the input set within a render.
 	return SHA256Hex([]byte(p.Namespace + "/" + p.Name))[:16]
+}
+
+func (r *ResourceSet) references(yield func(Reference) bool) {
+	for i, dep := range r.DependsOn {
+		ns := cmp.Or(dep.Namespace, r.Namespace)
+		if i, ok := kindIndex[dep.Kind]; ok && kindTable[i].skipNamespaceStamp {
+			ns = ""
+		}
+		if !yield(Reference{
+			Kind: dep.Kind, Namespace: ns, Name: dep.Name,
+			Use: "dependsOn", Position: i, ReadyExpr: dep.ReadyExpr,
+		}) {
+			return
+		}
+	}
+	for i, ref := range r.InputsFrom {
+		if !yield(Reference{
+			Kind: KindResourceSetInputProvider, Namespace: r.Namespace, Name: ref.Name,
+			Use: "inputsFrom", Position: i, Content: true,
+		}) {
+			return
+		}
+	}
+}
+
+func (r *ResourceSet) kind() KindInfo { return kindTable[kindResourceSet].KindInfo }
+
+func (p *ResourceSetInputProvider) kind() KindInfo {
+	return kindTable[kindResourceSetInputProvider].KindInfo
 }

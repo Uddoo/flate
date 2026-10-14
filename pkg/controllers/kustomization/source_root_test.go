@@ -16,13 +16,16 @@ func TestReconcile_OCICascadeDiagnostic(t *testing.T) {
 		t.Run(map[bool]string{false: "absent", true: "failed"}[failed], func(t *testing.T) {
 			c, st, _ := newControllerWithFixture(t)
 			ks := &manifest.Kustomization{
-				Name: "consumer", Namespace: "flux-system", Path: "./apps",
-				SourceKind: manifest.KindOCIRepository, SourceName: "missing", SourceNamespace: "flux-system",
+				Name: "consumer", Namespace: "flux-system",
+				Path: "./apps",
+				SourceRef: kustomizev1.CrossNamespaceSourceReference{
+					Kind: manifest.KindOCIRepository, Name: "missing", Namespace: "flux-system",
+				},
 			}
 			st.AddObject(ks)
 			st.UpdateStatus(ks.Named(), store.StatusPending, "")
 			if failed {
-				st.UpdateStatus(manifest.NamedResource{Kind: ks.SourceKind, Namespace: ks.SourceNamespace, Name: ks.SourceName}, store.StatusFailed, "fetch failed")
+				st.UpdateStatus(ks.SourceID(), store.StatusFailed, "fetch failed")
 			}
 			c.Tasks.Go(t.Context(), "oci cascade", func(ctx context.Context) {
 				if blocked := c.ReconcileNode(ctx, ks.Named(), manifest.DrainCascade); len(blocked) != 0 {
@@ -105,10 +108,8 @@ func TestResolveSourceRoot_ExplicitSourceRefUnchanged(t *testing.T) {
 	c := New(s, nil, nil, false)
 	ks := &manifest.Kustomization{
 		Name: "foo", Namespace: "flux-system",
-		Path:            "./app",
-		SourceKind:      manifest.KindGitRepository,
-		SourceName:      "external",
-		SourceNamespace: "flux-system",
+		Path:      "./app",
+		SourceRef: kustomizev1.CrossNamespaceSourceReference{Kind: manifest.KindGitRepository, Name: "external", Namespace: "flux-system"},
 	}
 	got, _, err := c.resolveSource(ks)
 	if err != nil {

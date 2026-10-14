@@ -43,9 +43,8 @@ func TestReadyExpr_ReplaceOverridesBuiltin(t *testing.T) {
 	s.SetCondition(dep, store.Condition{Type: "Healthy", Status: metav1.ConditionTrue, Reason: "MyCustomCheck"})
 
 	w := &Waiter{Store: s}
-	ref := manifest.DependencyRef{
-		NamedResource: dep,
-		ReadyExpr:     `dep.status.conditions.exists(c, c.type == "Healthy" && c.status == "True")`,
+	ref := manifest.DependencyRef{NamedResource: dep,
+		ReadyExpr: `dep.status.conditions.exists(c, c.type == "Healthy" && c.status == "True")`,
 	}
 	if got := w.Classify(ref, manifest.DrainNone); got.Kind != ClassReady {
 		t.Errorf("replace ReadyExpr true over Failed built-in: got %+v, want ClassReady", got)
