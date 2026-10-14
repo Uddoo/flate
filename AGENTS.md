@@ -10,8 +10,8 @@ point of the project: changed-only renders, a bounded parallel DAG, aggressive d
 ## Working here
 
 - The org [AI Usage Policy](https://github.com/home-operations/.github/blob/main/CONTRIBUTING.md#ai-usage-policy)
-  applies. PR bodies follow the org PR template (Overview, Additional information, Requirements). Fill the
-  Requirements section truthfully: the AI usage disclosure names each model that contributed, one line per model
+  applies. PR bodies follow the org PR template (Overview, Additional information, Requirements) and keep
+  its Requirements items. Fill that section truthfully: the AI usage disclosure names each model that contributed, one line per model
   with the effort it ran at and what it did, and is the only place a PR mentions AI.
 - PR titles are [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)
   (`fix(schedule): ...`); they become the squash commit and drive release-please, so they never
