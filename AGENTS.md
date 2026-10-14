@@ -10,10 +10,16 @@ point of the project: changed-only renders, a bounded parallel DAG, aggressive d
 ## Working here
 
 - The org [AI Usage Policy](https://github.com/home-operations/.github/blob/main/CONTRIBUTING.md#ai-usage-policy)
-  applies. Fill the PR template's Requirements section truthfully.
+  applies. PR bodies follow the org PR template (Overview, Additional information, Requirements). Fill the
+  Requirements section truthfully: the AI usage disclosure names each model that contributed, one line per model
+  with the effort it ran at and what it did, and is the only place a PR mentions AI.
 - PR titles are [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)
-  (`fix(schedule): ...`); they become the squash commit and drive release-please. Sign off
-  commits (`git commit -s`). Never commit, push, or open a PR unless asked.
+  (`fix(schedule): ...`); they become the squash commit and drive release-please, so they never
+  carry bead, workflow or run ids or suffixes. Sign off commits (`git commit -s`). Never commit,
+  push, or open a PR unless asked. A branch pushed for review holds one signed-off commit whose
+  message is the PR title, rebased onto `origin/main`, with `CGO_ENABLED=0 go build ./...` and
+  `mise run test` passing after the rebase; a rebase conflict outside `_test.go` files stops the
+  push. Never merge, approve or mark a PR ready; maintainers gate the merge queue.
 - Never touch secrets or gitignored files. Verify library APIs against the module cache or
   pkg.go.dev, not memory.
 - Solve the stated problem with the smallest diff: no speculative abstractions, no interface
