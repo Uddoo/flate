@@ -50,6 +50,8 @@ Leaf packages stay leaf: `tree` (stdlib only), `manifest`, `task`, `schedule` (s
   do not add `On*` callback hooks. Children are published through `base.Controller.Emit`. Every
   kind goes through the same generic paths: per-kind behaviour lives in a method on the manifest
   type, never in a kind switch in a consumer.
+- One fingerprint. Cache and change keys are `manifest.Fingerprint` over content, derived where the
+  cache lives; consumers never hash. No hand-rolled hashers, tags, framing or mtimes.
 - Stored manifests are immutable: clone, mutate the copy, `AddObject` again. Never write to an
   embedded `Spec` after parse.
 - Store listeners run inline and must never block on the store. Writers snapshot listeners
