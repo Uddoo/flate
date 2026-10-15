@@ -20,8 +20,8 @@ point of the project: changed-only renders, a bounded parallel DAG, aggressive d
   message is the PR title, rebased onto `origin/main`, with `CGO_ENABLED=0 go build ./...` and
   `mise run test` passing after the rebase; a rebase conflict outside `_test.go` files stops the
   push. Never merge or approve; maintainers gate the merge queue.
-- Never touch secrets or gitignored files. Verify library APIs against the module cache or
-  pkg.go.dev, not memory.
+- Never touch secrets or gitignored files, except a build's own artifact directory under `plans/`.
+  Verify library APIs against the module cache or pkg.go.dev, not memory.
 - Solve the stated problem with the smallest diff: no speculative abstractions, no interface
   or options struct with one caller, no new flags, no new dependencies. No drive-by refactors
   of unrelated code. Remove what your change orphans; clean up touched code in the same files
