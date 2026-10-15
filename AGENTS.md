@@ -19,8 +19,7 @@ point of the project: changed-only renders, a bounded parallel DAG, aggressive d
   push, or open a PR unless asked. A branch pushed for review holds one signed-off commit whose
   message is the PR title, rebased onto `origin/main`, with `CGO_ENABLED=0 go build ./...` and
   `mise run test` passing after the rebase; a rebase conflict outside `_test.go` files stops the
-  push. Open PRs ready for review, never as drafts. Never merge or approve; maintainers gate the
-  merge queue.
+  push. Never merge or approve; maintainers gate the merge queue.
 - Never touch secrets or gitignored files. Verify library APIs against the module cache or
   pkg.go.dev, not memory.
 - Solve the stated problem with the smallest diff: no speculative abstractions, no interface
