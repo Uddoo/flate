@@ -238,6 +238,23 @@ Tool versions pin via [mise](https://mise.jdx.dev). Testdata lives in [`testdata
 
 Release artifacts (archives, the Homebrew cask, SBOMs, and Cosign signatures) are built and published with [GoReleaser Pro](https://goreleaser.com/pro/). If it's useful to your own projects, consider [sponsoring its author](https://github.com/sponsors/caarlos0).
 
+## Usage as pre-commit hook
+
+This repo provides a [pre-commit](https://pre-commit.com/) hook, which runs `flate test all`. 
+It can also be used with [prek](https://prek.j178.dev/).
+
+Example `.pre-commit-config.yaml`: 
+
+```yaml
+--- 
+  repos: 
+  - repo: https://github.com/home-operations/flate
+    rev: v0.7.0
+    hooks:
+      - id: flate
+        verbose: true # optional
+```
+
 ## License
 
 AGPL-3.0. flate borrows behavior and test fixtures from [flux-local](https://github.com/allenporter/flux-local) (Apache-2.0).
