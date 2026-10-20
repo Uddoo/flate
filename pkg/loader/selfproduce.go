@@ -37,6 +37,15 @@ func (l *Loader) buildProductions(repoRoot string) {
 	record := func(v graphVisit) {
 		if v.owner != (manifest.NamedResource{}) && !v.generated {
 			l.recordReader(v.coordinate, v.localCoordinate(), v.owner)
+			if v.document != nil {
+				for _, patch := range v.document.Patches {
+					if ref, ok := resolveRef(v.dir, patch.Path); ok {
+						input := v
+						input.coordinate = path.Join(v.prefix, ref)
+						l.recordReader(input.coordinate, input.localCoordinate(), v.owner)
+					}
+				}
+			}
 		}
 		if v.document != nil {
 			delete(remaining, filepath.Dir(v.file))

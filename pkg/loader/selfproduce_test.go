@@ -231,11 +231,7 @@ func TestDiscoveryIndex_NilSafe(t *testing.T) {
 	}
 }
 
-// TestFinalizeIndex_OwnersOfFileResourcesEscape reproduces #833: an
-// overlay's kustomization.yaml pulls a resource in from outside its own
-// spec.path via a `resources:` entry. OwnersOfFile must attribute every
-// file the walk reads — both kustomization.yamls and the leaf resource —
-// back to the owning top-level Kustomization.
+// External resource and patch inputs must retain every owning Kustomization (#833, #1236).
 func TestFinalizeIndex_OwnersOfFileResourcesEscape(t *testing.T) {
 	t.Parallel()
 	for _, count := range []int{1, 2} {
@@ -245,11 +241,16 @@ func TestFinalizeIndex_OwnersOfFileResourcesEscape(t *testing.T) {
 			testutil.WriteFile(t, dir, "apps/homelab/kustomization.yaml",
 				"apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n  - ../base/postgres\n")
 			testutil.WriteFile(t, dir, "apps/base/postgres/kustomization.yaml",
-				"apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n  - cluster.yaml\n")
+				"apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n  - cluster.yaml\npatches:\n  - path: patch.yaml\n  - path: missing.yaml\n")
 			testutil.WriteFile(t, dir, "apps/base/postgres/cluster.yaml",
 				"apiVersion: postgresql.cnpg.io/v1\nkind: Cluster\nmetadata:\n  name: postgres\n")
+			testutil.WriteFile(t, dir, "apps/base/postgres/patch.yaml",
+				"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: patch-only\ndata: {value: patched}\n")
+			testutil.WriteFile(t, dir, "apps/unrelated/kustomization.yaml", "resources: []\n")
 
 			s := store.New()
+			unrelated := &manifest.Kustomization{Name: "unrelated", Namespace: "flux-system", Path: "./apps/unrelated"}
+			s.AddObject(unrelated)
 			var want []manifest.NamedResource
 			for i := range count {
 				ks := &manifest.Kustomization{Name: fmt.Sprintf("apps-%d", i), Namespace: "flux-system", Path: "./apps/homelab"}
@@ -263,16 +264,24 @@ func TestFinalizeIndex_OwnersOfFileResourcesEscape(t *testing.T) {
 				"apps/homelab/kustomization.yaml",
 				"apps/base/postgres/kustomization.yaml",
 				"apps/base/postgres/cluster.yaml",
+				"apps/base/postgres/patch.yaml",
+				"apps/base/postgres/missing.yaml",
 			} {
 				if got := idx.Readers[file]; !slices.Equal(got, want) {
 					t.Errorf("Readers[%s] = %v, want %v", file, got, want)
 				}
-			}
-			filter := change.NewFilter(change.NewSet([]string{"apps/base/postgres/cluster.yaml"}), idx, s)
-			for _, id := range want {
-				if !filter.ShouldReconcile(id) {
-					t.Errorf("changed shared base did not select %s", id)
+				filter := change.NewFilter(change.NewSet([]string{file}), idx, s)
+				for _, id := range want {
+					if !filter.ShouldReconcile(id) {
+						t.Errorf("changed shared input %s did not select %s", file, id)
+					}
 				}
+				if filter.ShouldReconcile(unrelated.Named()) {
+					t.Errorf("changed shared input %s selected unrelated overlay", file)
+				}
+			}
+			if _, ok := idx.Lookup(manifest.NamedResource{Kind: manifest.KindConfigMap, Name: "patch-only"}); ok {
+				t.Fatal("patch input was indexed as a produced resource")
 			}
 		})
 	}
